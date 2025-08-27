@@ -308,22 +308,32 @@ class StreamWorker(QtCore.QObject):
 
     def run_one_video(self, video_id: str):
         # Title + date overlay
+        # Title + date overlay
         title, pretty_date = self.get_metadata(video_id)
-        overlay_text = title if not pretty_date else f"{title} • {pretty_date}"
+        # Build overlay text with truncation (keep date intact)
+        suffix = f" • {pretty_date}" if pretty_date else ""
+        title_clean = (title or "").replace("\n", " ").strip()
 
-        # Adaptive font size based on title length
+        MAX_LEN = 75  # total length limit including suffix
+        if len(title_clean) + len(suffix) > MAX_LEN:
+            # leave room for "..." and the suffix; enforce a small minimum so it's not empty
+            avail = max(10, MAX_LEN - len(suffix) - 3)
+            title_clean = title_clean[:avail] + "..."
+
+        overlay_text = title_clean + suffix
+
+        # fixed font size
         font_size = 24
-        if len(overlay_text) > 100:
-            font_size = 18
-        if len(overlay_text) > 160:
-            font_size = 14
-        # Final hard cap to avoid insanely long titles overflowing even at 14pt
-        if len(overlay_text) > 220:
-            overlay_text = overlay_text[:217] + "..."
+
+        # write the text file for drawtext & stash fontsize
+        safe_write_text(Path(self.cfg.title_file), overlay_text)
+        self.cfg._overlay_fontsize = font_size
+
 
         # Save overlay text + font size for ffmpeg drawtext
         safe_write_text(Path(self.cfg.title_file), overlay_text)
         self.cfg._overlay_fontsize = font_size
+
 
         # Direct URLs and ffmpeg run (hidden window, own process group)
         vurl, aurl = self.get_stream_urls(video_id)
