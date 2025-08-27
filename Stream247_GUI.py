@@ -2,18 +2,25 @@
 # - Uses yt-dlp.exe (next to the EXE) for playlist IDs / titles / direct URLs
 # - Auto-selects NVENC > QSV > AMF > x264 via safe probe
 # - Runs ffmpeg and yt-dlp with hidden windows (no console)
-# - Clean Start/Stop (kills child procs, thread-safe)
+# - Clean Start/Stop (kills child procs; Windows fallback uses taskkill /T /F)
+# - "Remember playlist & key" (QSettings)
+# - Overlay shows: "<TITLE> • <Pretty Date>" with adaptive font size
 
-import os, sys, time, random, shutil, subprocess, threading
+import os, sys, time, json, random, shutil, subprocess, threading, datetime
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 APP_NAME = "Stream247"
+ORG_NAME = "Stream247"  # used by QSettings
 IS_WIN = (os.name == "nt")
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
+# Extra flags so ffmpeg is its own group (easier to kill on Windows)
+CREATE_NEW_PROCESS_GROUP = 0x00000200 if IS_WIN else 0
+DETACHED_PROCESS = 0x00000008 if IS_WIN else 0  # not used, but handy if needed
+
 STARTUPINFO = None
 if IS_WIN:
     STARTUPINFO = subprocess.STARTUPINFO()
@@ -44,7 +51,6 @@ def find_ffmpeg() -> Optional[str]:
     return find_binary(["ffmpeg", "ffmpeg.exe"])
 
 def find_ytdlp() -> Optional[str]:
-    # User will place yt-dlp.exe next to the EXE (or in PATH)
     return find_binary(["yt-dlp.exe", "yt-dlp"])
 
 def run_hidden(cmd: List[str], check=False, capture=True, text=True, timeout=None) -> subprocess.CompletedProcess:
@@ -75,6 +81,30 @@ def ffprobe_encoder(ffmpeg_path: str, codec: str) -> bool:
         return run_hidden(cmd).returncode == 0
     except Exception:
         return False
+
+def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts: Optional[int]) -> Optional[str]:
+    """
+    Make a pretty date like 'Aug 27, 2025' from:
+      - upload_date: 'YYYYMMDD'
+      - timestamp: epoch seconds
+      - release_timestamp: epoch seconds
+    """
+    dt = None
+    if upload_date and len(upload_date) == 8 and upload_date.isdigit():
+        try:
+            dt = datetime.datetime.strptime(upload_date, "%Y%m%d")
+        except Exception:
+            dt = None
+    if dt is None:
+        ts = release_ts or timestamp
+        if ts:
+            try:
+                dt = datetime.datetime.fromtimestamp(int(ts))
+            except Exception:
+                dt = None
+    if dt is None:
+        return None
+    return dt.strftime("%b %-d, %Y") if os.name != "nt" else dt.strftime("%b %#d, %Y")  # Windows needs %#d
 
 # ---------- streaming core ----------
 @dataclass
@@ -107,24 +137,53 @@ class StreamWorker(QtCore.QObject):
     status = QtCore.Signal(str)
     finished = QtCore.Signal()
 
+    # class-level annotation (OK for Pylance)
+    ff_proc: Optional[subprocess.Popen]
+
     def __init__(self, cfg: StreamConfig, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self._stop = threading.Event()
         self.ffmpeg_path = find_ffmpeg()
         self.ytdlp_path = find_ytdlp()
-        self.ff_proc: Optional[subprocess.Popen] = None
+        self.ff_proc = None
 
-    # ---- control ----
+    # ---------- control ----------
     def stop(self):
         self._stop.set()
+        self.log.emit("[INFO] Stop requested — killing ffmpeg…")
+
+        # Try graceful -> hard kill -> kill process tree -> global fallback
         try:
             if self.ff_proc and self.ff_proc.poll() is None:
-                self.ff_proc.kill()
-        except Exception:
-            pass
+                try:
+                    self.ff_proc.terminate()
+                    self.ff_proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+                if self.ff_proc.poll() is None:
+                    try:
+                        self.ff_proc.kill()
+                        self.ff_proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+                if IS_WIN and self.ff_proc and self.ff_proc.poll() is None:
+                    pid = str(self.ff_proc.pid)
+                    try:
+                        run_hidden(["taskkill", "/PID", pid, "/T", "/F"], capture=False)
+                    except Exception:
+                        pass
+                if IS_WIN and self.ff_proc and self.ff_proc.poll() is None:
+                    # Last resort: kills all ffmpeg.exe on the box
+                    self.log.emit("[WARN] Aggressive kill: taskkill /IM ffmpeg.exe /T /F")
+                    try:
+                        run_hidden(["taskkill", "/IM", "ffmpeg.exe", "/T", "/F"], capture=False)
+                    except Exception:
+                        pass
+        finally:
+            self.ff_proc = None
 
-    # ---- yt-dlp.exe helpers ----
+    # ---------- yt-dlp helpers ----------
     def get_video_ids(self, playlist_url: str) -> List[str]:
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found. Put it next to the EXE or in PATH.")
@@ -132,51 +191,56 @@ class StreamWorker(QtCore.QObject):
         cp = run_hidden(cmd)
         if cp.returncode != 0:
             raise RuntimeError(f"yt-dlp error: {cp.stderr.strip()}")
-        ids = [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
-        return ids
+        return [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
 
-    def get_title(self, video_id: str) -> str:
+    def get_metadata(self, video_id: str) -> Tuple[str, Optional[str]]:
+        """Return (title, pretty_date) using yt-dlp -j JSON."""
         if not self.ytdlp_path:
-            return f"https://www.youtube.com/watch?v={video_id}"
+            return self.get_title_legacy(video_id), None
         url = f"https://www.youtube.com/watch?v={video_id}"
-        cp = run_hidden([self.ytdlp_path, "--get-title", url])
-        if cp.returncode == 0 and cp.stdout:
-            return cp.stdout.strip()
-        return url
+        cp = run_hidden([self.ytdlp_path, "-j", url])
+        if cp.returncode != 0 or not cp.stdout:
+            return self.get_title_legacy(video_id), None
+        try:
+            data = json.loads(cp.stdout.strip().splitlines()[-1])
+        except Exception:
+            return self.get_title_legacy(video_id), None
+        title = data.get("title") or url
+        pretty_date = fmt_yt_date(data.get("upload_date"), data.get("timestamp"), data.get("release_timestamp"))
+        return title, pretty_date
 
-    def get_stream_urls(self, video_id: str) -> (str, Optional[str]):
+    def get_title_legacy(self, video_id: str) -> str:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        if not self.ytdlp_path:
+            return url
+        cp = run_hidden([self.ytdlp_path, "--get-title", url])
+        return (cp.stdout or "").strip() if cp.returncode == 0 and cp.stdout else url
+
+    def get_stream_urls(self, video_id: str) -> Tuple[str, Optional[str]]:
         """
         Use yt-dlp.exe to emit direct URLs:
-          - If progressive exists: single URL (audio+video)
-          - else: returns (video_url, audio_url)
+          - progressive -> (url, None)
+          - separate    -> (video_url, audio_url)
         """
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found.")
         url = f"https://www.youtube.com/watch?v={video_id}"
-        # Ask yt-dlp to print direct URLs. We try best video+audio; if progressive,
-        # yt-dlp will still output one or two lines depending on format selection.
-        # Use modern selection to prefer h264 streams when possible.
         fmt = "bv*+ba/best"
         cp = run_hidden([self.ytdlp_path, "-g", "-f", fmt, url])
         if cp.returncode != 0:
             raise RuntimeError(f"yt-dlp -g failed: {cp.stderr.strip()}")
-
         lines = [ln.strip() for ln in (cp.stdout or "").splitlines() if ln.strip()]
         if not lines:
             raise RuntimeError("No playable formats found.")
-        if len(lines) == 1:
-            return lines[0], None
-        # when two lines: first is video, second is audio
-        return lines[0], lines[1]
+        return (lines[0], None) if len(lines) == 1 else (lines[0], lines[1])
 
-    # ---- encoder selection ----
+    # ---------- encoder selection ----------
     def select_encoder(self):
         # Defaults
         self.cfg.encoder = "libx264"
         self.cfg.encoder_name = "CPU x264"
         self.cfg.pix_fmt = "yuv420p"
         self.cfg.extra_venc_flags = ["-preset", "veryfast"]
-
         if not self.ffmpeg_path:
             return
 
@@ -190,14 +254,12 @@ class StreamWorker(QtCore.QObject):
                 "-spatial_aq", "1", "-temporal_aq", "1", "-aq-strength", "8"
             ]
             return
-
         if ffprobe_encoder(self.ffmpeg_path, "h264_qsv"):
             self.cfg.encoder = "h264_qsv"
             self.cfg.encoder_name = "Intel Quick Sync"
             self.cfg.pix_fmt = "nv12"
             self.cfg.extra_venc_flags = ["-look_ahead", "1"]
             return
-
         if ffprobe_encoder(self.ffmpeg_path, "h264_amf"):
             self.cfg.encoder = "h264_amf"
             self.cfg.encoder_name = "AMD AMF"
@@ -205,15 +267,16 @@ class StreamWorker(QtCore.QObject):
             self.cfg.extra_venc_flags = ["-rc", "cbr", "-quality", "quality", "-usage", "transcoding"]
             return
 
-    # ---- ffmpeg ----
+    # ---------- ffmpeg ----------
     def build_ffmpeg_cmd(self, vurl: str, aurl: Optional[str]) -> List[str]:
         gop = self.cfg.fps * 2
         vf = [f"scale=-2:{self.cfg.height}:flags=bicubic"]
         if self.cfg.overlay_titles:
             fontfile = self.cfg.fontfile.replace(":", r"\:")
+            fontsize = getattr(self.cfg, "_overlay_fontsize", 24)
             vf.append(
                 f"drawtext=fontfile='{fontfile}':textfile='{self.cfg.title_file}':reload=1:"
-                f"fontcolor=white:fontsize=24:box=1:boxcolor=black@0.5:x=10:y=10"
+                f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
             )
         vf.append(f"format={self.cfg.pix_fmt}")
 
@@ -244,33 +307,58 @@ class StreamWorker(QtCore.QObject):
         return cmd
 
     def run_one_video(self, video_id: str):
-        # Get direct URLs (no yt-dlp subprocess piping, no console)
+        # Title + date overlay
+        title, pretty_date = self.get_metadata(video_id)
+        overlay_text = title if not pretty_date else f"{title} • {pretty_date}"
+
+        # Adaptive font size based on title length
+        font_size = 24
+        if len(overlay_text) > 100:
+            font_size = 18
+        if len(overlay_text) > 160:
+            font_size = 14
+        # Final hard cap to avoid insanely long titles overflowing even at 14pt
+        if len(overlay_text) > 220:
+            overlay_text = overlay_text[:217] + "..."
+
+        # Save overlay text + font size for ffmpeg drawtext
+        safe_write_text(Path(self.cfg.title_file), overlay_text)
+        self.cfg._overlay_fontsize = font_size
+
+        # Direct URLs and ffmpeg run (hidden window, own process group)
         vurl, aurl = self.get_stream_urls(video_id)
         ff_cmd = self.build_ffmpeg_cmd(vurl, aurl)
         self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
 
-        # Start ffmpeg hidden; stream until it exits
+        # Start ffmpeg with NO pipes; we'll poll so Stop is responsive
         self.ff_proc = subprocess.Popen(
             ff_cmd,
             stdin=None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=None,
+            stderr=None,
             startupinfo=STARTUPINFO,
-            creationflags=CREATE_NO_WINDOW
+            creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         )
 
-        # pump ffmpeg log into the GUI console
-        if self.ff_proc.stdout:
-            for line in iter(self.ff_proc.stdout.readline, b""):
-                if self._stop.is_set():
-                    break
-                try:
-                    self.log.emit(line.decode("utf-8", errors="ignore").rstrip())
-                except Exception:
-                    pass
+        # Poll until ffmpeg exits or Stop is requested
+        while self.ff_proc and self.ff_proc.poll() is None and not self._stop.is_set():
+            time.sleep(0.2)
 
-        self.ff_proc.wait()
+        # If Stop was pressed and ffmpeg is still around, let stop() finish the kill
+        if self._stop.is_set() and self.ff_proc and self.ff_proc.poll() is None:
+            try:
+                self.ff_proc.kill()
+            except Exception:
+                pass
 
+        # Ensure it's gone
+        try:
+            if self.ff_proc:
+                self.ff_proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+    # ---------- main loop ----------
     @QtCore.Slot()
     def run(self):
         if not self.ffmpeg_path:
@@ -295,9 +383,11 @@ class StreamWorker(QtCore.QObject):
                 if not ids:
                     self.log.emit("[WARN] No IDs found; retrying in 30s…")
                     for _ in range(30):
-                        if self._stop.is_set(): break
+                        if self._stop.is_set():
+                            break
                         time.sleep(1)
                     continue
+
                 if self.cfg.shuffle:
                     random.shuffle(ids)
 
@@ -305,12 +395,8 @@ class StreamWorker(QtCore.QObject):
                     if self._stop.is_set():
                         break
 
-                    title = self.get_title(vid)
-                    safe_write_text(Path(self.cfg.title_file), title)
-
                     self.log.emit("-" * 46)
-                    self.log.emit(f"[INFO] Item #{idx} - {title}")
-                    self.log.emit(f"[INFO] URL: https://www.youtube.com/watch?v={vid}")
+                    self.log.emit(f"[INFO] Item #{idx} - https://www.youtube.com/watch?v={vid}")
                     self.log.emit("-" * 46)
 
                     try:
@@ -323,7 +409,8 @@ class StreamWorker(QtCore.QObject):
                     if self.cfg.sleep_between > 0:
                         self.log.emit(f"[INFO] Sleeping {self.cfg.sleep_between}s…")
                         for _ in range(self.cfg.sleep_between):
-                            if self._stop.is_set(): break
+                            if self._stop.is_set():
+                                break
                             time.sleep(1)
 
                 if self._stop.is_set():
@@ -333,7 +420,8 @@ class StreamWorker(QtCore.QObject):
             except Exception as e:
                 self.log.emit(f"[WARN] Loop error: {e}. Retrying in 30s…")
                 for _ in range(30):
-                    if self._stop.is_set(): break
+                    if self._stop.is_set():
+                        break
                     time.sleep(1)
 
         self.status.emit("Stopped")
@@ -359,10 +447,13 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} — YouTube 24/7 VOD Streamer")
-        self.setMinimumSize(860, 620)
+        self.setMinimumSize(860, 680)
         self.worker_thread: Optional[QtCore.QThread] = None
         self.worker: Optional[StreamWorker] = None
         self.streaming = False
+
+        # Settings (QSettings)
+        self.settings = QtCore.QSettings(ORG_NAME, APP_NAME)
 
         # Inputs
         self.playlist_edit = QtWidgets.QLineEdit("")
@@ -381,6 +472,8 @@ class MainWindow(QtWidgets.QWidget):
         self.shuffle_chk = QtWidgets.QCheckBox("Shuffle playlist order")
         self.console_chk = QtWidgets.QCheckBox("Show console")
         self.console_chk.setChecked(True)
+        self.remember_chk = QtWidgets.QCheckBox("Remember playlist & key (stores in user settings)")
+        self.remember_chk.setChecked(True)
 
         self.console = QtWidgets.QTextEdit()
         self.console.setReadOnly(True)
@@ -411,6 +504,10 @@ class MainWindow(QtWidgets.QWidget):
         toggles.addStretch(1)
         toggles.addWidget(self.console_chk)
 
+        bottom_opts = QtWidgets.QHBoxLayout()
+        bottom_opts.addWidget(self.remember_chk)
+        bottom_opts.addStretch(1)
+
         btns = QtWidgets.QHBoxLayout()
         btns.addWidget(self.start_btn)
         btns.addWidget(self.stop_btn)
@@ -423,6 +520,7 @@ class MainWindow(QtWidgets.QWidget):
         v.addWidget(header)
         v.addLayout(form)
         v.addLayout(toggles)
+        v.addLayout(bottom_opts)
         v.addLayout(btns)
         v.addWidget(self.console, 1)
 
@@ -433,6 +531,30 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
 
         self.on_quality_change()
+        self.load_settings()
+
+    # --- settings ---
+    def load_settings(self):
+        remember = self.settings.value("remember", "true")
+        self.remember_chk.setChecked(str(remember).lower() == "true")
+        if self.remember_chk.isChecked():
+            pl = self.settings.value("playlist_url", "", type=str)
+            sk = self.settings.value("stream_key", "", type=str)
+            self.playlist_edit.setText(pl or "")
+            self.key_edit.setText(sk or "")
+
+    def save_settings(self):
+        self.settings.setValue("remember", "true" if self.remember_chk.isChecked() else "false")
+        if self.remember_chk.isChecked():
+            self.settings.setValue("playlist_url", self.playlist_edit.text().strip())
+            self.settings.setValue("stream_key", self.key_edit.text().strip())
+        else:
+            self.settings.remove("playlist_url")
+            self.settings.remove("stream_key")
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.save_settings()
+        return super().closeEvent(event)
 
     # --- UI helpers ---
     def append_log(self, text: str):
@@ -479,6 +601,9 @@ class MainWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, APP_NAME, "Please enter Playlist URL and Stream Key.")
             return
 
+        # save settings right when starting (if 'remember' is checked)
+        self.save_settings()
+
         self.streaming = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -492,6 +617,8 @@ class MainWindow(QtWidgets.QWidget):
         self.worker.log.connect(self.append_log)
         self.worker.status.connect(lambda s: self.append_log(f"[STATUS] {s}"))
         self.worker.finished.connect(self.on_finished)
+
+        # Keep a stop signal for completeness, but call worker.stop() directly on Stop
         self.stopRequested.connect(self.worker.stop)
 
         self.worker_thread.start()
@@ -500,10 +627,19 @@ class MainWindow(QtWidgets.QWidget):
         if not self.streaming:
             return
         self.append_log("[INFO] Stopping…")
+
+        # Call the worker's stop immediately (don’t wait for queued signal)
+        try:
+            if self.worker:
+                self.worker.stop()
+        except Exception:
+            pass
+
+        # Also emit the signal (harmless if already stopped)
         self.stopRequested.emit()
-        if self.worker_thread:
-            self.worker_thread.quit()
-            self.worker_thread.wait(5000)
+
+        # Do not quit the thread here; let on_finished() handle cleanup
+        self.stop_btn.setEnabled(False)
 
     def on_finished(self):
         self.append_log("[INFO] Worker finished.")
@@ -527,7 +663,7 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(DARK_QSS)
     w = MainWindow()
-    w.resize(980, 660)
+    w.resize(980, 700)
     w.show()
     sys.exit(app.exec())
 
