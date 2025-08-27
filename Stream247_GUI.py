@@ -1,13 +1,10 @@
 # Stream247_GUI.py
-import os, sys, time, random, shutil, subprocess, threading
+import os, sys, time, random, shutil, subprocess, threading, json
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from yt_dlp import YoutubeDL
-
-import subprocess
 # ...
 IS_WIN = (os.name == "nt")
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
@@ -108,17 +105,29 @@ class StreamWorker(QtCore.QObject):
 
     # ---- yt-dlp ----
     def get_video_ids(self, playlist_url: str) -> List[str]:
-        ydl_opts = {"quiet": True, "extract_flat": True, "skip_download": True}
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(playlist_url, download=False)
+        cmd = [
+            sys.executable, "-m", "yt_dlp", "--flat-playlist", "-J", playlist_url
+        ]
+        try:
+            out = subprocess.check_output(
+                cmd, text=True, creationflags=CREATE_NO_WINDOW, startupinfo=STARTUPINFO
+            )
+            info = json.loads(out)
+        except Exception:
+            return []
         entries = info.get("entries", []) or []
         return [e.get("id") for e in entries if e.get("id")]
 
     def get_title(self, video_id: str) -> str:
         url = f"https://www.youtube.com/watch?v={video_id}"
-        ydl_opts = {"quiet": True, "skip_download": True}
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        cmd = [sys.executable, "-m", "yt_dlp", "-J", url]
+        try:
+            out = subprocess.check_output(
+                cmd, text=True, creationflags=CREATE_NO_WINDOW, startupinfo=STARTUPINFO
+            )
+            info = json.loads(out)
+        except Exception:
+            return url
         return info.get("title", url)
 
     # ---- encoder selection ----
