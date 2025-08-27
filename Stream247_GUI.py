@@ -7,6 +7,16 @@ from typing import List, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from yt_dlp import YoutubeDL
 
+import subprocess
+# ...
+IS_WIN = (os.name == "nt")
+CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
+STARTUPINFO = None
+if IS_WIN:
+    STARTUPINFO = subprocess.STARTUPINFO()
+    STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+
 APP_NAME = "Stream247"
 
 # ---------- utility ----------
@@ -291,13 +301,14 @@ class MainWindow(QtWidgets.QWidget):
         self.streaming = False
 
         # Inputs
-        self.playlist_edit = QtWidgets.QLineEdit("https://www.youtube.com/playlist?list=PLbqa7knaJj8JAgvaCJjYJokPyMdfQdxk_")
+        self.playlist_edit = QtWidgets.QLineEdit("")
+        self.playlist_edit.setPlaceholderText("Your Stream Playlist here")
         self.key_edit = QtWidgets.QLineEdit("")
         self.key_edit.setPlaceholderText("Your YouTube stream key…")
         self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
 
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["720p30 (stable)", "720p60", "1080p30"])
+        self.res_combo.addItems(["720p30", "720p60", "1080p30"])
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
 
