@@ -1,41 +1,61 @@
-# Stream247_GUI.py
+# Stream247_GUI.py — GUI YouTube 24/7 streamer
+# - Uses yt-dlp.exe (next to the EXE) for playlist IDs / titles / direct URLs
+# - Auto-selects NVENC > QSV > AMF > x264 via safe probe
+# - Runs ffmpeg and yt-dlp with hidden windows (no console)
+# - Clean Start/Stop (kills child procs, thread-safe)
+
 import os, sys, time, random, shutil, subprocess, threading
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from yt_dlp import YoutubeDL
 
-import subprocess
-# ...
+APP_NAME = "Stream247"
 IS_WIN = (os.name == "nt")
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
 STARTUPINFO = None
 if IS_WIN:
     STARTUPINFO = subprocess.STARTUPINFO()
-    STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # hide windows
 
-
-APP_NAME = "Stream247"
-
-# ---------- utility ----------
+# ---------- utilities ----------
 def resource_path(name: str) -> str:
+    """Resolve a bundled resource (PyInstaller) or local file."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         p = Path(sys._MEIPASS) / name  # type: ignore[attr-defined]
         if p.exists():
             return str(p)
-    return str(Path(os.getcwd()) / name)
+    return str(Path.cwd() / name)
 
-def find_ffmpeg() -> Optional[str]:
-    ff = shutil.which("ffmpeg")
-    if ff:
-        return ff
-    for candidate in ("ffmpeg.exe", "ffmpeg"):
-        rp = resource_path(candidate)
+def find_binary(candidates: List[str]) -> Optional[str]:
+    """Find an executable in PATH, bundle, or current dir."""
+    for c in candidates:
+        p = shutil.which(c)
+        if p:
+            return p
+    for c in candidates:
+        rp = resource_path(c)
         if Path(rp).exists():
             return rp
     return None
+
+def find_ffmpeg() -> Optional[str]:
+    return find_binary(["ffmpeg", "ffmpeg.exe"])
+
+def find_ytdlp() -> Optional[str]:
+    # User will place yt-dlp.exe next to the EXE (or in PATH)
+    return find_binary(["yt-dlp.exe", "yt-dlp"])
+
+def run_hidden(cmd: List[str], check=False, capture=True, text=True, timeout=None) -> subprocess.CompletedProcess:
+    """Run a command with no visible window; optionally capture output."""
+    kwargs = dict(
+        startupinfo=STARTUPINFO,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    if capture:
+        kwargs.update(dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text))
+    return subprocess.run(cmd, check=check, timeout=timeout, **kwargs)
 
 def safe_write_text(path: Path, text: str) -> None:
     try:
@@ -44,15 +64,15 @@ def safe_write_text(path: Path, text: str) -> None:
         pass
 
 def ffprobe_encoder(ffmpeg_path: str, codec: str) -> bool:
-    """Probe an encoder by doing a tiny encode at a safe size (NVENC needs > tiny)."""
+    """Try a tiny encode at a safe size; NVENC needs > tiny (use 320x180)."""
     try:
-        null = "NUL" if os.name == "nt" else "/dev/null"
+        null = "NUL" if IS_WIN else "/dev/null"
         cmd = [
             ffmpeg_path, "-hide_banner", "-loglevel", "error",
             "-f", "lavfi", "-i", "color=black:s=320x180:rate=30",
             "-t", "0.2", "-c:v", codec, "-f", "null", null
         ]
-        return subprocess.run(cmd).returncode == 0
+        return run_hidden(cmd).returncode == 0
     except Exception:
         return False
 
@@ -73,7 +93,7 @@ class StreamConfig:
     fontfile: str = r"C:\Windows\Fonts\arial.ttf"
     title_file: str = "current_title.txt"
 
-    # filled at runtime by encoder selection
+    # runtime-selected
     encoder: str = "libx264"
     encoder_name: str = "CPU x264"
     pix_fmt: str = "yuv420p"
@@ -92,34 +112,62 @@ class StreamWorker(QtCore.QObject):
         self.cfg = cfg
         self._stop = threading.Event()
         self.ffmpeg_path = find_ffmpeg()
+        self.ytdlp_path = find_ytdlp()
         self.ff_proc: Optional[subprocess.Popen] = None
-        self.yt_proc: Optional[subprocess.Popen] = None
 
     # ---- control ----
     def stop(self):
         self._stop.set()
-        # Kill child processes to break the pipe immediately
-        for p in (self.yt_proc, self.ff_proc):
-            try:
-                if p and p.poll() is None:
-                    p.kill()
-            except Exception:
-                pass
+        try:
+            if self.ff_proc and self.ff_proc.poll() is None:
+                self.ff_proc.kill()
+        except Exception:
+            pass
 
-    # ---- yt-dlp ----
+    # ---- yt-dlp.exe helpers ----
     def get_video_ids(self, playlist_url: str) -> List[str]:
-        ydl_opts = {"quiet": True, "extract_flat": True, "skip_download": True}
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(playlist_url, download=False)
-        entries = info.get("entries", []) or []
-        return [e.get("id") for e in entries if e.get("id")]
+        if not self.ytdlp_path:
+            raise RuntimeError("yt-dlp.exe not found. Put it next to the EXE or in PATH.")
+        cmd = [self.ytdlp_path, "--ignore-errors", "--flat-playlist", "--get-id", playlist_url]
+        cp = run_hidden(cmd)
+        if cp.returncode != 0:
+            raise RuntimeError(f"yt-dlp error: {cp.stderr.strip()}")
+        ids = [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
+        return ids
 
     def get_title(self, video_id: str) -> str:
+        if not self.ytdlp_path:
+            return f"https://www.youtube.com/watch?v={video_id}"
         url = f"https://www.youtube.com/watch?v={video_id}"
-        ydl_opts = {"quiet": True, "skip_download": True}
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        return info.get("title", url)
+        cp = run_hidden([self.ytdlp_path, "--get-title", url])
+        if cp.returncode == 0 and cp.stdout:
+            return cp.stdout.strip()
+        return url
+
+    def get_stream_urls(self, video_id: str) -> (str, Optional[str]):
+        """
+        Use yt-dlp.exe to emit direct URLs:
+          - If progressive exists: single URL (audio+video)
+          - else: returns (video_url, audio_url)
+        """
+        if not self.ytdlp_path:
+            raise RuntimeError("yt-dlp.exe not found.")
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        # Ask yt-dlp to print direct URLs. We try best video+audio; if progressive,
+        # yt-dlp will still output one or two lines depending on format selection.
+        # Use modern selection to prefer h264 streams when possible.
+        fmt = "bv*+ba/best"
+        cp = run_hidden([self.ytdlp_path, "-g", "-f", fmt, url])
+        if cp.returncode != 0:
+            raise RuntimeError(f"yt-dlp -g failed: {cp.stderr.strip()}")
+
+        lines = [ln.strip() for ln in (cp.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            raise RuntimeError("No playable formats found.")
+        if len(lines) == 1:
+            return lines[0], None
+        # when two lines: first is video, second is audio
+        return lines[0], lines[1]
 
     # ---- encoder selection ----
     def select_encoder(self):
@@ -158,7 +206,7 @@ class StreamWorker(QtCore.QObject):
             return
 
     # ---- ffmpeg ----
-    def build_ffmpeg_cmd(self) -> List[str]:
+    def build_ffmpeg_cmd(self, vurl: str, aurl: Optional[str]) -> List[str]:
         gop = self.cfg.fps * 2
         vf = [f"scale=-2:{self.cfg.height}:flags=bicubic"]
         if self.cfg.overlay_titles:
@@ -169,11 +217,22 @@ class StreamWorker(QtCore.QObject):
             )
         vf.append(f"format={self.cfg.pix_fmt}")
 
-        return [
+        cmd = [
             self.ffmpeg_path or "ffmpeg",
-            "-thread_queue_size", "1024",
             "-hide_banner", "-loglevel", "warning", "-stats",
-            "-re", "-i", "pipe:0",
+            "-re", "-i", vurl,
+        ]
+        if aurl:
+            cmd += ["-re", "-i", aurl]
+
+        maps = ["-map", "0:v:0"]
+        if aurl:
+            maps += ["-map", "1:a:0"]
+        else:
+            maps += ["-map", "0:a:0?"]  # optional audio if progressive
+
+        cmd += [
+            *maps,
             "-c:v", self.cfg.encoder, *self.cfg.extra_venc_flags,
             "-fflags", "+genpts",
             "-r", str(self.cfg.fps), "-g", str(gop), "-keyint_min", str(gop),
@@ -182,35 +241,44 @@ class StreamWorker(QtCore.QObject):
             "-c:a", "aac", "-b:a", self.cfg.audio_bitrate, "-ar", "44100", "-ac", "2",
             "-f", "flv", self.cfg.rtmp_url()
         ]
+        return cmd
 
     def run_one_video(self, video_id: str):
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        ytdlp_cmd = [
-            sys.executable, "-m", "yt_dlp",
-            "-o", "-", "-f", "bv*+ba/best", url,
-            "--retries", "9999999", "--fragment-retries", "9999999",
-            "--concurrent-fragments", "5", "--no-warnings", "--quiet"
-        ]
-
-        ff_cmd = self.build_ffmpeg_cmd()
+        # Get direct URLs (no yt-dlp subprocess piping, no console)
+        vurl, aurl = self.get_stream_urls(video_id)
+        ff_cmd = self.build_ffmpeg_cmd(vurl, aurl)
         self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
-        try:
-            self.ff_proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE)
-            self.yt_proc = subprocess.Popen(ytdlp_cmd, stdout=self.ff_proc.stdin)
-            self.yt_proc.wait()
-        finally:
-            try:
-                if self.ff_proc and self.ff_proc.stdin:
-                    self.ff_proc.stdin.close()
-            except Exception:
-                pass
-            if self.ff_proc:
-                self.ff_proc.wait()
+
+        # Start ffmpeg hidden; stream until it exits
+        self.ff_proc = subprocess.Popen(
+            ff_cmd,
+            stdin=None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            startupinfo=STARTUPINFO,
+            creationflags=CREATE_NO_WINDOW
+        )
+
+        # pump ffmpeg log into the GUI console
+        if self.ff_proc.stdout:
+            for line in iter(self.ff_proc.stdout.readline, b""):
+                if self._stop.is_set():
+                    break
+                try:
+                    self.log.emit(line.decode("utf-8", errors="ignore").rstrip())
+                except Exception:
+                    pass
+
+        self.ff_proc.wait()
 
     @QtCore.Slot()
     def run(self):
         if not self.ffmpeg_path:
-            self.log.emit("[ERROR] ffmpeg not found. Put ffmpeg.exe beside the EXE or in PATH.")
+            self.log.emit("[ERROR] ffmpeg not found. Put ffmpeg.exe next to the EXE or in PATH.")
+            self.finished.emit()
+            return
+        if not self.ytdlp_path:
+            self.log.emit("[ERROR] yt-dlp.exe not found. Put yt-dlp.exe next to the EXE or in PATH.")
             self.finished.emit()
             return
 
@@ -237,11 +305,7 @@ class StreamWorker(QtCore.QObject):
                     if self._stop.is_set():
                         break
 
-                    title = ""
-                    try:
-                        title = self.get_title(vid)
-                    except Exception:
-                        title = f"https://www.youtube.com/watch?v={vid}"
+                    title = self.get_title(vid)
                     safe_write_text(Path(self.cfg.title_file), title)
 
                     self.log.emit("-" * 46)
@@ -264,8 +328,8 @@ class StreamWorker(QtCore.QObject):
 
                 if self._stop.is_set():
                     break
-
                 self.log.emit("\n[INFO] End of playlist. Refreshing IDs and looping…\n")
+
             except Exception as e:
                 self.log.emit(f"[WARN] Loop error: {e}. Retrying in 30s…")
                 for _ in range(30):
@@ -295,20 +359,20 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} — YouTube 24/7 VOD Streamer")
-        self.setMinimumSize(840, 600)
+        self.setMinimumSize(860, 620)
         self.worker_thread: Optional[QtCore.QThread] = None
         self.worker: Optional[StreamWorker] = None
         self.streaming = False
 
         # Inputs
         self.playlist_edit = QtWidgets.QLineEdit("")
-        self.playlist_edit.setPlaceholderText("Your Stream Playlist here")
+        self.playlist_edit.setPlaceholderText("Your YouTube playlist URL…")
         self.key_edit = QtWidgets.QLineEdit("")
         self.key_edit.setPlaceholderText("Your YouTube stream key…")
         self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
 
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["720p30", "720p60", "1080p30"])
+        self.res_combo.addItems(["720p30 (stable)", "720p60", "1080p30"])
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
 
@@ -457,13 +521,13 @@ class MainWindow(QtWidgets.QWidget):
 
 # ---------- entry ----------
 def main():
-    # Optional DPI flag; safe to omit if it warns
+    # (Optional DPI flag; safe to omit if it warns)
     # QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps)
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(DARK_QSS)
     w = MainWindow()
-    w.resize(960, 640)
+    w.resize(980, 660)
     w.show()
     sys.exit(app.exec())
 
