@@ -10,6 +10,13 @@ import os, sys, time, json, random, shutil, subprocess, threading, datetime
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from pathlib import Path
+import sys, os
+
+def resource_path(relpath: str) -> str:
+    """Return path to bundled resource, working for PyInstaller --onefile and source runs."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
+    return os.path.join(base, relpath)
+
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -460,7 +467,7 @@ class MainWindow(QtWidgets.QWidget):
         self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
 
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["720p30 (stable)", "720p60", "1080p30"])
+        self.res_combo.addItems(["720p30", "720p60", "1080p30"])
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
 
@@ -469,7 +476,7 @@ class MainWindow(QtWidgets.QWidget):
         self.shuffle_chk = QtWidgets.QCheckBox("Shuffle playlist order")
         self.console_chk = QtWidgets.QCheckBox("Show console")
         self.console_chk.setChecked(True)
-        self.remember_chk = QtWidgets.QCheckBox("Remember playlist & key (save to config.json)")
+        self.remember_chk = QtWidgets.QCheckBox("Save playlist and key")
         self.remember_chk.setChecked(True)
 
         self.console = QtWidgets.QTextEdit()
@@ -685,12 +692,21 @@ class MainWindow(QtWidgets.QWidget):
 
 # ---------- entry ----------
 def main():
-    # (Optional DPI flag; safe to omit if it warns)
-    # QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    # Ensure taskbar groups under our app and can show our icon (Windows)
+    if IS_WIN:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_NAME)
+
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps)
     app = QtWidgets.QApplication(sys.argv)
+
+    # Load .ico (next to EXE when frozen, or cwd when running from source)
+    icon = QtGui.QIcon(resource_path("icon.ico"))
+    app.setWindowIcon(icon)  # taskbar/dock icon
+
     app.setStyleSheet(DARK_QSS)
     w = MainWindow()
+    w.setWindowIcon(icon)    # title-bar icon
     w.resize(980, 700)
     w.show()
     sys.exit(app.exec())
