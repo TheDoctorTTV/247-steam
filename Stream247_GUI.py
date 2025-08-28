@@ -2,33 +2,51 @@
 # - Uses yt-dlp.exe (next to the EXE) for playlist IDs / titles / direct URLs
 # - Auto-selects NVENC > QSV > AMF > x264 via safe probe
 # - Runs ffmpeg and yt-dlp with hidden windows (no console)
-# - Clean Start/Stop (kills child procs; Windows fallback uses taskkill /T /F)
-# - "Remember playlist & key" (QSettings)
-# - Overlay shows: "<TITLE> • <Pretty Date>" with adaptive font size
+# - Clean Start/Stop (kills ffmpeg reliably; Windows fallback uses taskkill /T /F)
+# - Saves config to config.json next to the EXE
+# - Overlay shows: "<TITLE> • <Pretty Date>" with title truncation (date preserved)
 
 import os, sys, time, json, random, shutil, subprocess, threading, datetime
-from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 APP_NAME = "Stream247"
-ORG_NAME = "Stream247"  # used by QSettings
 IS_WIN = (os.name == "nt")
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
-# Extra flags so ffmpeg is its own group (easier to kill on Windows)
 CREATE_NEW_PROCESS_GROUP = 0x00000200 if IS_WIN else 0
-DETACHED_PROCESS = 0x00000008 if IS_WIN else 0  # not used, but handy if needed
 
 STARTUPINFO = None
 if IS_WIN:
     STARTUPINFO = subprocess.STARTUPINFO()
     STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # hide windows
 
-# ---------- utilities ----------
+# ---------- config.json helpers ----------
+def _app_dir() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys.executable).parent  # packaged exe folder
+    return Path.cwd()                       # running from source
+
+CONFIG_PATH = _app_dir() / "config.json"
+
+def load_config_json() -> dict:
+    try:
+        if CONFIG_PATH.exists():
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def save_config_json(data: dict) -> None:
+    try:
+        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+# ---------- misc utilities ----------
 def resource_path(name: str) -> str:
-    """Resolve a bundled resource (PyInstaller) or local file."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         p = Path(sys._MEIPASS) / name  # type: ignore[attr-defined]
         if p.exists():
@@ -36,7 +54,6 @@ def resource_path(name: str) -> str:
     return str(Path.cwd() / name)
 
 def find_binary(candidates: List[str]) -> Optional[str]:
-    """Find an executable in PATH, bundle, or current dir."""
     for c in candidates:
         p = shutil.which(c)
         if p:
@@ -54,11 +71,7 @@ def find_ytdlp() -> Optional[str]:
     return find_binary(["yt-dlp.exe", "yt-dlp"])
 
 def run_hidden(cmd: List[str], check=False, capture=True, text=True, timeout=None) -> subprocess.CompletedProcess:
-    """Run a command with no visible window; optionally capture output."""
-    kwargs = dict(
-        startupinfo=STARTUPINFO,
-        creationflags=CREATE_NO_WINDOW,
-    )
+    kwargs = dict(startupinfo=STARTUPINFO, creationflags=CREATE_NO_WINDOW)
     if capture:
         kwargs.update(dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text))
     return subprocess.run(cmd, check=check, timeout=timeout, **kwargs)
@@ -70,7 +83,6 @@ def safe_write_text(path: Path, text: str) -> None:
         pass
 
 def ffprobe_encoder(ffmpeg_path: str, codec: str) -> bool:
-    """Try a tiny encode at a safe size; NVENC needs > tiny (use 320x180)."""
     try:
         null = "NUL" if IS_WIN else "/dev/null"
         cmd = [
@@ -83,12 +95,6 @@ def ffprobe_encoder(ffmpeg_path: str, codec: str) -> bool:
         return False
 
 def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts: Optional[int]) -> Optional[str]:
-    """
-    Make a pretty date like 'Aug 27, 2025' from:
-      - upload_date: 'YYYYMMDD'
-      - timestamp: epoch seconds
-      - release_timestamp: epoch seconds
-    """
     dt = None
     if upload_date and len(upload_date) == 8 and upload_date.isdigit():
         try:
@@ -104,7 +110,7 @@ def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts
                 dt = None
     if dt is None:
         return None
-    return dt.strftime("%b %-d, %Y") if os.name != "nt" else dt.strftime("%b %#d, %Y")  # Windows needs %#d
+    return dt.strftime("%b %#d, %Y") if IS_WIN else dt.strftime("%b %-d, %Y")
 
 # ---------- streaming core ----------
 @dataclass
@@ -137,7 +143,6 @@ class StreamWorker(QtCore.QObject):
     status = QtCore.Signal(str)
     finished = QtCore.Signal()
 
-    # class-level annotation (OK for Pylance)
     ff_proc: Optional[subprocess.Popen]
 
     def __init__(self, cfg: StreamConfig, parent=None):
@@ -152,8 +157,6 @@ class StreamWorker(QtCore.QObject):
     def stop(self):
         self._stop.set()
         self.log.emit("[INFO] Stop requested — killing ffmpeg…")
-
-        # Try graceful -> hard kill -> kill process tree -> global fallback
         try:
             if self.ff_proc and self.ff_proc.poll() is None:
                 try:
@@ -161,20 +164,18 @@ class StreamWorker(QtCore.QObject):
                     self.ff_proc.wait(timeout=1.0)
                 except Exception:
                     pass
-                if self.ff_proc.poll() is None:
+                if self.ff_proc and self.ff_proc.poll() is None:
                     try:
                         self.ff_proc.kill()
                         self.ff_proc.wait(timeout=1.0)
                     except Exception:
                         pass
                 if IS_WIN and self.ff_proc and self.ff_proc.poll() is None:
-                    pid = str(self.ff_proc.pid)
                     try:
-                        run_hidden(["taskkill", "/PID", pid, "/T", "/F"], capture=False)
+                        run_hidden(["taskkill", "/PID", str(self.ff_proc.pid), "/T", "/F"], capture=False)
                     except Exception:
                         pass
                 if IS_WIN and self.ff_proc and self.ff_proc.poll() is None:
-                    # Last resort: kills all ffmpeg.exe on the box
                     self.log.emit("[WARN] Aggressive kill: taskkill /IM ffmpeg.exe /T /F")
                     try:
                         run_hidden(["taskkill", "/IM", "ffmpeg.exe", "/T", "/F"], capture=False)
@@ -194,7 +195,6 @@ class StreamWorker(QtCore.QObject):
         return [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
 
     def get_metadata(self, video_id: str) -> Tuple[str, Optional[str]]:
-        """Return (title, pretty_date) using yt-dlp -j JSON."""
         if not self.ytdlp_path:
             return self.get_title_legacy(video_id), None
         url = f"https://www.youtube.com/watch?v={video_id}"
@@ -217,11 +217,6 @@ class StreamWorker(QtCore.QObject):
         return (cp.stdout or "").strip() if cp.returncode == 0 and cp.stdout else url
 
     def get_stream_urls(self, video_id: str) -> Tuple[str, Optional[str]]:
-        """
-        Use yt-dlp.exe to emit direct URLs:
-          - progressive -> (url, None)
-          - separate    -> (video_url, audio_url)
-        """
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found.")
         url = f"https://www.youtube.com/watch?v={video_id}"
@@ -236,15 +231,12 @@ class StreamWorker(QtCore.QObject):
 
     # ---------- encoder selection ----------
     def select_encoder(self):
-        # Defaults
         self.cfg.encoder = "libx264"
         self.cfg.encoder_name = "CPU x264"
         self.cfg.pix_fmt = "yuv420p"
         self.cfg.extra_venc_flags = ["-preset", "veryfast"]
         if not self.ffmpeg_path:
             return
-
-        # NVENC → QSV → AMF
         if ffprobe_encoder(self.ffmpeg_path, "h264_nvenc"):
             self.cfg.encoder = "h264_nvenc"
             self.cfg.encoder_name = "NVIDIA NVENC"
@@ -307,40 +299,29 @@ class StreamWorker(QtCore.QObject):
         return cmd
 
     def run_one_video(self, video_id: str):
-        # Title + date overlay
-        # Title + date overlay
+        # Title + date overlay (truncate title; keep date intact)
         title, pretty_date = self.get_metadata(video_id)
-        # Build overlay text with truncation (keep date intact)
-        suffix = f" • {pretty_date}" if pretty_date else ""
-        title_clean = (title or "").replace("\n", " ").strip()
+        if self.cfg.overlay_titles:
+            suffix = f" • {pretty_date}" if pretty_date else ""
+            title_clean = (title or "").replace("\n", " ").strip()
 
-        MAX_LEN = 75  # total length limit including suffix
-        if len(title_clean) + len(suffix) > MAX_LEN:
-            # leave room for "..." and the suffix; enforce a small minimum so it's not empty
-            avail = max(10, MAX_LEN - len(suffix) - 3)
-            title_clean = title_clean[:avail] + "..."
+            MAX_LEN = 75  # total length including suffix
+            if len(title_clean) + len(suffix) > MAX_LEN:
+                avail = max(10, MAX_LEN - len(suffix) - 3)  # leave room for "..."
+                title_clean = title_clean[:avail] + "..."
 
-        overlay_text = title_clean + suffix
-
-        # fixed font size
-        font_size = 24
-
-        # write the text file for drawtext & stash fontsize
-        safe_write_text(Path(self.cfg.title_file), overlay_text)
-        self.cfg._overlay_fontsize = font_size
-
-
-        # Save overlay text + font size for ffmpeg drawtext
-        safe_write_text(Path(self.cfg.title_file), overlay_text)
-        self.cfg._overlay_fontsize = font_size
-
+            overlay_text = title_clean + suffix
+            self.cfg._overlay_fontsize = 24
+            safe_write_text(Path(self.cfg.title_file), overlay_text)
+        else:
+            if hasattr(self.cfg, "_overlay_fontsize"):
+                delattr(self.cfg, "_overlay_fontsize")
 
         # Direct URLs and ffmpeg run (hidden window, own process group)
         vurl, aurl = self.get_stream_urls(video_id)
         ff_cmd = self.build_ffmpeg_cmd(vurl, aurl)
         self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
 
-        # Start ffmpeg with NO pipes; we'll poll so Stop is responsive
         self.ff_proc = subprocess.Popen(
             ff_cmd,
             stdin=None,
@@ -350,18 +331,15 @@ class StreamWorker(QtCore.QObject):
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         )
 
-        # Poll until ffmpeg exits or Stop is requested
         while self.ff_proc and self.ff_proc.poll() is None and not self._stop.is_set():
             time.sleep(0.2)
 
-        # If Stop was pressed and ffmpeg is still around, let stop() finish the kill
         if self._stop.is_set() and self.ff_proc and self.ff_proc.poll() is None:
             try:
                 self.ff_proc.kill()
             except Exception:
                 pass
 
-        # Ensure it's gone
         try:
             if self.ff_proc:
                 self.ff_proc.wait(timeout=1.0)
@@ -437,17 +415,29 @@ class StreamWorker(QtCore.QObject):
         self.status.emit("Stopped")
         self.finished.emit()
 
-# ---------- GUI ----------
+# ---------- GUI (dark & readable checkboxes) ----------
 DARK_QSS = """
 * { color: #e6e6e6; font-family: Segoe UI, Arial, sans-serif; }
 QWidget { background: #111315; }
-QLineEdit, QComboBox, QTextEdit, QSpinBox { background: #1a1d21; border: 1px solid #2a2f36; border-radius: 8px; padding: 6px; }
+QLineEdit, QComboBox, QTextEdit, QSpinBox {
+  background: #1a1d21; border: 1px solid #2a2f36; border-radius: 8px; padding: 6px;
+}
 QPushButton { background: #2b6cb0; border: none; border-radius: 10px; padding: 8px 12px; font-weight: 600; }
 QPushButton:hover { background: #2f76c2; }
 QPushButton:disabled { background: #2a2f36; color: #8a8f98; }
 QGroupBox { border: 1px solid #2a2f36; border-radius: 10px; margin-top: 12px; }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
-QCheckBox::indicator { width: 16px; height: 16px; }
+
+QCheckBox::indicator {
+  width: 18px; height: 18px; border: 1px solid #2a2f36; border-radius: 4px;
+  background: #1a1d21;
+}
+QCheckBox::indicator:checked {
+  background: #2b6cb0; border: 1px solid #2b6cb0; image: none;
+}
+QCheckBox::indicator:unchecked {
+  background: #1a1d21; image: none;
+}
 """
 
 class MainWindow(QtWidgets.QWidget):
@@ -461,9 +451,6 @@ class MainWindow(QtWidgets.QWidget):
         self.worker_thread: Optional[QtCore.QThread] = None
         self.worker: Optional[StreamWorker] = None
         self.streaming = False
-
-        # Settings (QSettings)
-        self.settings = QtCore.QSettings(ORG_NAME, APP_NAME)
 
         # Inputs
         self.playlist_edit = QtWidgets.QLineEdit("")
@@ -482,7 +469,7 @@ class MainWindow(QtWidgets.QWidget):
         self.shuffle_chk = QtWidgets.QCheckBox("Shuffle playlist order")
         self.console_chk = QtWidgets.QCheckBox("Show console")
         self.console_chk.setChecked(True)
-        self.remember_chk = QtWidgets.QCheckBox("Remember playlist & key (stores in user settings)")
+        self.remember_chk = QtWidgets.QCheckBox("Remember playlist & key (save to config.json)")
         self.remember_chk.setChecked(True)
 
         self.console = QtWidgets.QTextEdit()
@@ -540,27 +527,58 @@ class MainWindow(QtWidgets.QWidget):
         self.console_chk.toggled.connect(self.console.setVisible)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
 
+        # persist as you tweak
+        self.remember_chk.toggled.connect(lambda _: self.save_settings())
+        self.overlay_chk.toggled.connect(lambda _: self.save_settings())
+        self.shuffle_chk.toggled.connect(lambda _: self.save_settings())
+        self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
+        self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
+        self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
+
         self.on_quality_change()
         self.load_settings()
 
-    # --- settings ---
+    # --- settings (config.json) ---
     def load_settings(self):
-        remember = self.settings.value("remember", "true")
-        self.remember_chk.setChecked(str(remember).lower() == "true")
-        if self.remember_chk.isChecked():
-            pl = self.settings.value("playlist_url", "", type=str)
-            sk = self.settings.value("stream_key", "", type=str)
-            self.playlist_edit.setText(pl or "")
-            self.key_edit.setText(sk or "")
+        cfg = load_config_json()
+        remember = str(cfg.get("remember", True)).lower() in ("1", "true", "yes", "on")
+        self.remember_chk.setChecked(remember)
+
+        if remember:
+            self.playlist_edit.setText(cfg.get("playlist_url", ""))
+            self.key_edit.setText(cfg.get("stream_key", ""))
+
+        self.overlay_chk.setChecked(bool(cfg.get("overlay_titles", True)))
+        self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
+
+        if "quality" in cfg:
+            try:
+                idx = ["720p30 (stable)", "720p60", "1080p30"].index(cfg["quality"])
+                self.res_combo.setCurrentIndex(idx)
+            except Exception:
+                pass
+        if "video_bitrate" in cfg:
+            self.bitrate_edit.setText(cfg["video_bitrate"])
+        if "bufsize" in cfg:
+            self.bufsize_edit.setText(cfg["bufsize"])
 
     def save_settings(self):
-        self.settings.setValue("remember", "true" if self.remember_chk.isChecked() else "false")
+        data = load_config_json()
+        data.update({
+            "remember": self.remember_chk.isChecked(),
+            "overlay_titles": self.overlay_chk.isChecked(),
+            "shuffle": self.shuffle_chk.isChecked(),
+            "quality": self.res_combo.currentText(),
+            "video_bitrate": self.bitrate_edit.text().strip(),
+            "bufsize": self.bufsize_edit.text().strip(),
+        })
         if self.remember_chk.isChecked():
-            self.settings.setValue("playlist_url", self.playlist_edit.text().strip())
-            self.settings.setValue("stream_key", self.key_edit.text().strip())
+            data["playlist_url"] = self.playlist_edit.text().strip()
+            data["stream_key"] = self.key_edit.text().strip()
         else:
-            self.settings.remove("playlist_url")
-            self.settings.remove("stream_key")
+            data.pop("playlist_url", None)
+            data.pop("stream_key", None)
+        save_config_json(data)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.save_settings()
