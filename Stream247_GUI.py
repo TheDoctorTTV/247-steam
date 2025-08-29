@@ -10,8 +10,6 @@ import os, sys, time, json, random, shutil, subprocess, threading, datetime
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from pathlib import Path
-
-
 from PySide6 import QtCore, QtGui, QtWidgets
 
 APP_NAME = "Stream247"
@@ -48,10 +46,10 @@ def save_config_json(data: dict) -> None:
 
 # ---------- misc utilities ----------
 def resource_path(name: str) -> str:
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        p = Path(sys._MEIPASS) / name  # type: ignore[attr-defined]
-        if p.exists():
-            return str(p)
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
+    p = Path(base) / name
+    if p.exists():
+        return str(p)
     return str(Path.cwd() / name)
 
 def find_binary(candidates: List[str]) -> Optional[str]:
@@ -360,7 +358,6 @@ class StreamWorker(QtCore.QObject):
         except Exception:
             pass
 
-        self._skip.clear()
 
     def run_bumper(self):
         path = self.cfg.bumper_path
@@ -372,7 +369,7 @@ class StreamWorker(QtCore.QObject):
         ff_cmd = self.build_ffmpeg_cmd(path, None)
         self.cfg.overlay_titles = prev_overlay
         self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
-        self._skip.clear()
+
         self.ff_proc = subprocess.Popen(
             ff_cmd,
             stdin=None,
@@ -381,11 +378,13 @@ class StreamWorker(QtCore.QObject):
             startupinfo=STARTUPINFO,
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         )
+
         while self.ff_proc and self.ff_proc.poll() is None and not (
             self._stop.is_set() or self._skip.is_set()
         ):
             time.sleep(0.2)
         if (self._stop.is_set() or self._skip.is_set()) and self.ff_proc and self.ff_proc.poll() is None:
+
             try:
                 self.ff_proc.kill()
             except Exception:
@@ -395,7 +394,7 @@ class StreamWorker(QtCore.QObject):
                 self.ff_proc.wait(timeout=1.0)
         except Exception:
             pass
-        self._skip.clear()
+
 
     # ---------- main loop ----------
     @QtCore.Slot()
@@ -449,6 +448,7 @@ class StreamWorker(QtCore.QObject):
                         self.run_bumper()
                     if self._stop.is_set():
                         break
+
 
                 if self._stop.is_set():
                     break
