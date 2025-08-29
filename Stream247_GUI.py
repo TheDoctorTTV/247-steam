@@ -112,28 +112,6 @@ def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts
     return dt.strftime("%b %#d, %Y") if IS_WIN else dt.strftime("%b %-d, %Y")
 
 
-def default_font_path() -> str:
-    """Return a reasonable default font path for the current OS."""
-    if IS_WIN:
-        candidates = [
-            r"C:\\Windows\\Fonts\\arial.ttf",
-            r"C:\\Windows\\Fonts\\Arial.ttf",
-        ]
-    elif sys.platform == "darwin":
-        candidates = [
-            "/Library/Fonts/Arial.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-        ]
-    else:  # Linux and others
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        ]
-    for c in candidates:
-        if Path(c).exists():
-            return c
-    return ""
-
 # ---------- streaming core ----------
 @dataclass
 class StreamConfig:
@@ -148,7 +126,6 @@ class StreamConfig:
     overlay_titles: bool = True
     shuffle: bool = False
     sleep_between: int = 0
-    fontfile: str = field(default_factory=default_font_path)
     title_file: str = "current_title.txt"
 
     # runtime-selected
@@ -296,18 +273,14 @@ class StreamWorker(QtCore.QObject):
         gop = self.cfg.fps * 2
         vf = [f"scale=-2:{self.cfg.height}:flags=bicubic"]
         if self.cfg.overlay_titles:
-            font_path = Path(self.cfg.fontfile)
-            if self.cfg.fontfile and font_path.exists():
-                fontfile = font_path.as_posix().replace(":", r"\:").replace("'", r"\\'")
-                title_file = Path(self.cfg.title_file).as_posix().replace(":", r"\:").replace("'", r"\\'")
-                fontsize = getattr(self.cfg, "_overlay_fontsize", 24)
-                vf.append(
-                    f"drawtext=fontfile='{fontfile}':textfile='{title_file}':reload=1:"
-                    f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
-                )
-            elif self.cfg.fontfile:
-                self.log.emit(f"[WARN] Font file not found: {font_path}")
-        vf.append(f"format={self.cfg.pix_fmt}")
+            title_file = Path(self.cfg.title_file).as_posix().replace(":", r"\:").replace("'", r"\\'")
+            fontsize = getattr(self.cfg, "_overlay_fontsize", 24)
+            vf.append(
+                f"drawtext=textfile='{title_file}':reload=1:"
+                f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
+            )
+        vf.append(f"format={self.cfg.pix_fmt}")  # keep format as a separate filter
+        vf_chain = ",".join(vf)
 
         cmd = [
             self.ffmpeg_path or "ffmpeg",
@@ -329,7 +302,7 @@ class StreamWorker(QtCore.QObject):
             "-fflags", "+genpts",
             "-r", str(self.cfg.fps), "-g", str(gop), "-keyint_min", str(gop),
             "-b:v", self.cfg.video_bitrate, "-maxrate", self.cfg.video_bitrate, "-bufsize", self.cfg.bufsize,
-            "-vf", ",".join(vf),
+            "-vf", vf_chain,
             "-c:a", "aac", "-b:a", self.cfg.audio_bitrate, "-ar", "44100", "-ac", "2",
             "-f", "flv", self.cfg.rtmp_url()
         ]
@@ -362,11 +335,29 @@ class StreamWorker(QtCore.QObject):
         self.ff_proc = subprocess.Popen(
             ff_cmd,
             stdin=None,
-            stdout=None,
-            stderr=None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
             startupinfo=STARTUPINFO,
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         )
+
+        def _reader(stream):
+            for line in iter(stream.readline, ""):
+                self.log.emit(line.rstrip())
+
+        readers = []
+        if self.ff_proc.stdout:
+            t = threading.Thread(target=_reader, args=(self.ff_proc.stdout,))
+            t.daemon = True
+            t.start()
+            readers.append(t)
+        if self.ff_proc.stderr:
+            t = threading.Thread(target=_reader, args=(self.ff_proc.stderr,))
+            t.daemon = True
+            t.start()
+            readers.append(t)
 
         while self.ff_proc and self.ff_proc.poll() is None and not (
             self._stop.is_set() or self._skip.is_set()
@@ -384,6 +375,19 @@ class StreamWorker(QtCore.QObject):
                 self.ff_proc.wait(timeout=1.0)
         except Exception:
             pass
+
+        for t in readers:
+            t.join(timeout=0.2)
+
+        # Ensure any buffered ffmpeg output is flushed after the process exits
+        if self.ff_proc:
+            for stream in (self.ff_proc.stdout, self.ff_proc.stderr):
+                if stream:
+                    leftover = stream.read()
+                    if leftover:
+                        for line in leftover.splitlines():
+                            self.log.emit(line.rstrip())
+                    stream.close()
 
 
     # ---------- main loop ----------
@@ -489,6 +493,7 @@ class MainWindow(QtWidgets.QWidget):
         self.worker_thread: Optional[QtCore.QThread] = None
         self.worker: Optional[StreamWorker] = None
         self.streaming = False
+        self.log_fh = None
 
         # Inputs
         self.playlist_edit = QtWidgets.QLineEdit("")
@@ -502,12 +507,11 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo.setCurrentText("720p30")
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
-        self.font_edit = QtWidgets.QLineEdit(default_font_path())
-        self.font_btn = QtWidgets.QPushButton("Font…")
 
         self.overlay_chk = QtWidgets.QCheckBox("Overlay current VOD title")
         self.overlay_chk.setChecked(True)
         self.shuffle_chk = QtWidgets.QCheckBox("Shuffle playlist order")
+        self.logfile_chk = QtWidgets.QCheckBox("Log to file")
         self.console_chk = QtWidgets.QCheckBox("Show console")
         self.console_chk.setChecked(True)
         self.remember_chk = QtWidgets.QCheckBox("Save playlist and key")
@@ -538,13 +542,10 @@ class MainWindow(QtWidgets.QWidget):
         form.addWidget(QtWidgets.QLabel("Buffer Size"), 3, 2)
         form.addWidget(self.bufsize_edit, 3, 3)
 
-        form.addWidget(QtWidgets.QLabel("Overlay Font"), 4, 0)
-        form.addWidget(self.font_edit, 4, 1, 1, 2)
-        form.addWidget(self.font_btn, 4, 3)
-
         toggles = QtWidgets.QHBoxLayout()
         toggles.addWidget(self.overlay_chk)
         toggles.addWidget(self.shuffle_chk)
+        toggles.addWidget(self.logfile_chk)
         toggles.addStretch(1)
         toggles.addWidget(self.console_chk)
 
@@ -575,16 +576,15 @@ class MainWindow(QtWidgets.QWidget):
         self.skip_btn.clicked.connect(self.on_skip)
         self.console_chk.toggled.connect(self.on_console_toggle)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
-        self.font_btn.clicked.connect(self.on_browse_font)
 
         # persist as you tweak
         self.remember_chk.toggled.connect(lambda _: self.save_settings())
         self.overlay_chk.toggled.connect(lambda _: self.save_settings())
         self.shuffle_chk.toggled.connect(lambda _: self.save_settings())
+        self.logfile_chk.toggled.connect(lambda _: self.save_settings())
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
-        self.font_edit.textChanged.connect(lambda _: self.save_settings())
 
         self.on_quality_change()
         self.load_settings()
@@ -601,7 +601,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self.overlay_chk.setChecked(bool(cfg.get("overlay_titles", True)))
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
-        self.font_edit.setText(cfg.get("fontfile", default_font_path()))
+        self.logfile_chk.setChecked(bool(cfg.get("log_to_file", False)))
 
         if "quality" in cfg:
             idx = self.res_combo.findText(cfg["quality"])
@@ -618,10 +618,10 @@ class MainWindow(QtWidgets.QWidget):
             "remember": self.remember_chk.isChecked(),
             "overlay_titles": self.overlay_chk.isChecked(),
             "shuffle": self.shuffle_chk.isChecked(),
+            "log_to_file": self.logfile_chk.isChecked(),
             "quality": self.res_combo.currentText(),
             "video_bitrate": self.bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
-            "fontfile": self.font_edit.text().strip(),
         })
         if self.remember_chk.isChecked():
             data["playlist_url"] = self.playlist_edit.text().strip()
@@ -639,17 +639,12 @@ class MainWindow(QtWidgets.QWidget):
     def append_log(self, text: str):
         self.console.append(text)
         self.console.moveCursor(QtGui.QTextCursor.End)
-
-    def on_browse_font(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select overlay font",
-            "",
-            "Font Files (*.ttf *.otf *.ttc);;All Files (*)",
-        )
-        if path:
-            self.font_edit.setText(path)
-            self.save_settings()
+        if self.log_fh:
+            try:
+                self.log_fh.write(text + "\n")
+                self.log_fh.flush()
+            except Exception:
+                pass
 
     def on_console_toggle(self, checked: bool):
         """Show or hide the log console without shifting the rest of the UI."""
@@ -697,7 +692,6 @@ class MainWindow(QtWidgets.QWidget):
             overlay_titles=self.overlay_chk.isChecked(),
             shuffle=self.shuffle_chk.isChecked(),
             sleep_between=0,
-            fontfile=self.font_edit.text().strip() or default_font_path(),
             title_file="current_title.txt",
         )
 
@@ -712,6 +706,22 @@ class MainWindow(QtWidgets.QWidget):
 
         # save settings right when starting (if 'remember' is checked)
         self.save_settings()
+
+        if self.log_fh:
+            try:
+                self.log_fh.close()
+            except Exception:
+                pass
+            self.log_fh = None
+        if self.logfile_chk.isChecked():
+            log_path = _app_dir() / "latest.log"
+            try:
+                if log_path.exists():
+                    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                    log_path.rename(log_path.with_name(f"{log_path.stem}-{ts}{log_path.suffix}"))
+                self.log_fh = log_path.open("w", encoding="utf-8")
+            except Exception:
+                self.log_fh = None
 
         self.streaming = True
         self.start_btn.setEnabled(False)
@@ -763,6 +773,12 @@ class MainWindow(QtWidgets.QWidget):
 
     def on_finished(self):
         self.append_log("[INFO] Worker finished.")
+        if self.log_fh:
+            try:
+                self.log_fh.close()
+            except Exception:
+                pass
+            self.log_fh = None
         try:
             if self.worker_thread:
                 self.worker_thread.quit()
