@@ -155,6 +155,7 @@ class StreamConfig:
     encoder: str = "libx264"
     encoder_name: str = "CPU x264"
     pix_fmt: str = "yuv420p"
+    output_pix_fmt: str = "yuv420p"
     extra_venc_flags: List[str] = None  # type: ignore
 
     def rtmp_url(self) -> str:
@@ -266,6 +267,7 @@ class StreamWorker(QtCore.QObject):
         self.cfg.encoder = "libx264"
         self.cfg.encoder_name = "CPU x264"
         self.cfg.pix_fmt = "yuv420p"
+        self.cfg.output_pix_fmt = "yuv420p"
         self.cfg.extra_venc_flags = ["-preset", "veryfast"]
         if not self.ffmpeg_path:
             return
@@ -281,10 +283,10 @@ class StreamWorker(QtCore.QObject):
         if ffprobe_encoder(self.ffmpeg_path, "h264_qsv"):
             self.cfg.encoder = "h264_qsv"
             self.cfg.encoder_name = "Intel Quick Sync"
-            # Quick Sync works internally with NV12 but YouTube expects yuv420p;
-            # using yuv420p here ensures compatibility and avoids encoding
-            # errors on systems where "look_ahead" isn't supported.
-            self.cfg.pix_fmt = "yuv420p"
+            # Feed NV12 to the hardware encoder but tag the output stream
+            # as yuv420p for FLV/RTMP compatibility.
+            self.cfg.pix_fmt = "nv12"
+            self.cfg.output_pix_fmt = "yuv420p"
             self.cfg.extra_venc_flags = ["-preset", "veryfast"]
             return
         if ffprobe_encoder(self.ffmpeg_path, "h264_amf"):
@@ -329,6 +331,7 @@ class StreamWorker(QtCore.QObject):
         cmd += [
             *maps,
             "-c:v", self.cfg.encoder, *self.cfg.extra_venc_flags,
+            "-pix_fmt", self.cfg.output_pix_fmt,
             "-fflags", "+genpts",
             "-r", str(self.cfg.fps), "-g", str(gop), "-keyint_min", str(gop),
             "-b:v", self.cfg.video_bitrate, "-maxrate", self.cfg.video_bitrate, "-bufsize", self.cfg.bufsize,
