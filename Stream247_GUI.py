@@ -112,28 +112,6 @@ def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts
     return dt.strftime("%b %#d, %Y") if IS_WIN else dt.strftime("%b %-d, %Y")
 
 
-def default_font_path() -> str:
-    """Return a reasonable default font path for the current OS."""
-    if IS_WIN:
-        candidates = [
-            r"C:\\Windows\\Fonts\\arial.ttf",
-            r"C:\\Windows\\Fonts\\Arial.ttf",
-        ]
-    elif sys.platform == "darwin":
-        candidates = [
-            "/Library/Fonts/Arial.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-        ]
-    else:  # Linux and others
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        ]
-    for c in candidates:
-        if Path(c).exists():
-            return c
-    return ""
-
 # ---------- streaming core ----------
 @dataclass
 class StreamConfig:
@@ -148,7 +126,6 @@ class StreamConfig:
     overlay_titles: bool = True
     shuffle: bool = False
     sleep_between: int = 0
-    fontfile: str = field(default_factory=default_font_path)
     title_file: str = "current_title.txt"
 
     # runtime-selected
@@ -296,17 +273,12 @@ class StreamWorker(QtCore.QObject):
         gop = self.cfg.fps * 2
         vf = [f"scale=-2:{self.cfg.height}:flags=bicubic"]
         if self.cfg.overlay_titles:
-            font_path = Path(self.cfg.fontfile)
-            if self.cfg.fontfile and font_path.exists():
-                fontfile = font_path.as_posix().replace(":", r"\:").replace("'", r"\\'")
-                title_file = Path(self.cfg.title_file).as_posix().replace(":", r"\:").replace("'", r"\\'")
-                fontsize = getattr(self.cfg, "_overlay_fontsize", 24)
-                vf.append(
-                    f"drawtext=fontfile='{fontfile}':textfile='{title_file}':reload=1:"
-                    f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
-                )
-            elif self.cfg.fontfile:
-                self.log.emit(f"[WARN] Font file not found: {font_path}")
+            title_file = Path(self.cfg.title_file).as_posix().replace(":", r"\:").replace("'", r"\\'")
+            fontsize = getattr(self.cfg, "_overlay_fontsize", 24)
+            vf.append(
+                f"drawtext=textfile='{title_file}':reload=1:"
+                f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
+            )
         vf.append(f"format={self.cfg.pix_fmt}")  # keep format as a separate filter
         vf_chain = ",".join(vf)
 
@@ -535,8 +507,6 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo.setCurrentText("720p30")
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
-        self.font_edit = QtWidgets.QLineEdit(default_font_path())
-        self.font_btn = QtWidgets.QPushButton("Font…")
 
         self.overlay_chk = QtWidgets.QCheckBox("Overlay current VOD title")
         self.overlay_chk.setChecked(True)
@@ -572,10 +542,6 @@ class MainWindow(QtWidgets.QWidget):
         form.addWidget(QtWidgets.QLabel("Buffer Size"), 3, 2)
         form.addWidget(self.bufsize_edit, 3, 3)
 
-        form.addWidget(QtWidgets.QLabel("Overlay Font"), 4, 0)
-        form.addWidget(self.font_edit, 4, 1, 1, 2)
-        form.addWidget(self.font_btn, 4, 3)
-
         toggles = QtWidgets.QHBoxLayout()
         toggles.addWidget(self.overlay_chk)
         toggles.addWidget(self.shuffle_chk)
@@ -610,7 +576,6 @@ class MainWindow(QtWidgets.QWidget):
         self.skip_btn.clicked.connect(self.on_skip)
         self.console_chk.toggled.connect(self.on_console_toggle)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
-        self.font_btn.clicked.connect(self.on_browse_font)
 
         # persist as you tweak
         self.remember_chk.toggled.connect(lambda _: self.save_settings())
@@ -620,7 +585,6 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
-        self.font_edit.textChanged.connect(lambda _: self.save_settings())
 
         self.on_quality_change()
         self.load_settings()
@@ -638,7 +602,6 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay_chk.setChecked(bool(cfg.get("overlay_titles", True)))
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
         self.logfile_chk.setChecked(bool(cfg.get("log_to_file", False)))
-        self.font_edit.setText(cfg.get("fontfile", default_font_path()))
 
         if "quality" in cfg:
             idx = self.res_combo.findText(cfg["quality"])
@@ -659,7 +622,6 @@ class MainWindow(QtWidgets.QWidget):
             "quality": self.res_combo.currentText(),
             "video_bitrate": self.bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
-            "fontfile": self.font_edit.text().strip(),
         })
         if self.remember_chk.isChecked():
             data["playlist_url"] = self.playlist_edit.text().strip()
@@ -683,17 +645,6 @@ class MainWindow(QtWidgets.QWidget):
                 self.log_fh.flush()
             except Exception:
                 pass
-
-    def on_browse_font(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select overlay font",
-            "",
-            "Font Files (*.ttf *.otf *.ttc);;All Files (*)",
-        )
-        if path:
-            self.font_edit.setText(path)
-            self.save_settings()
 
     def on_console_toggle(self, checked: bool):
         """Show or hide the log console without shifting the rest of the UI."""
@@ -741,7 +692,6 @@ class MainWindow(QtWidgets.QWidget):
             overlay_titles=self.overlay_chk.isChecked(),
             shuffle=self.shuffle_chk.isChecked(),
             sleep_between=0,
-            fontfile=self.font_edit.text().strip() or default_font_path(),
             title_file="current_title.txt",
         )
 
