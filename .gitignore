@@ -181,3 +181,5 @@ cython_debug/
 .cursorindexingignore
 *.txt
 *.json
+ffmpeg.exe
+yt-dlp.exe
