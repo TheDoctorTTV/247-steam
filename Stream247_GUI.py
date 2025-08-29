@@ -561,20 +561,41 @@ class MainWindow(QtWidgets.QWidget):
         self.skip_btn = QtWidgets.QPushButton("Skip Video")
         self.skip_btn.setEnabled(False)
 
-        # Layout
-        form = QtWidgets.QGridLayout()
-        form.addWidget(QtWidgets.QLabel("Playlist URL"), 0, 0)
-        form.addWidget(self.playlist_edit, 0, 1, 1, 3)
-        form.addWidget(QtWidgets.QLabel("Stream Key"), 1, 0)
-        form.addWidget(self.key_edit, 1, 1, 1, 3)
+        # --- Tabs ---
+        tabs = QtWidgets.QTabWidget()
 
-        form.addWidget(QtWidgets.QLabel("Quality"), 2, 0)
-        form.addWidget(self.res_combo, 2, 1)
-        form.addWidget(QtWidgets.QLabel("Video Bitrate"), 2, 2)
-        form.addWidget(self.bitrate_edit, 2, 3)
+        # Stream Tab
+        stream_tab = QtWidgets.QWidget()
+        stream_layout = QtWidgets.QVBoxLayout(stream_tab)
 
-        form.addWidget(QtWidgets.QLabel("Buffer Size"), 3, 2)
-        form.addWidget(self.bufsize_edit, 3, 3)
+        stream_form = QtWidgets.QGridLayout()
+        stream_form.addWidget(QtWidgets.QLabel("Playlist URL"), 0, 0)
+        stream_form.addWidget(self.playlist_edit, 0, 1, 1, 3)
+        stream_form.addWidget(QtWidgets.QLabel("Stream Key"), 1, 0)
+        stream_form.addWidget(self.key_edit, 1, 1, 1, 3)
+        stream_layout.addLayout(stream_form)
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addWidget(self.start_btn)
+        btns.addWidget(self.stop_btn)
+        btns.addWidget(self.skip_btn)
+        btns.addStretch(1)
+        stream_layout.addLayout(btns)
+        stream_layout.addWidget(self.console, 1)
+        tabs.addTab(stream_tab, "Stream")
+
+        # Settings Tab
+        settings_tab = QtWidgets.QWidget()
+        settings_layout = QtWidgets.QVBoxLayout(settings_tab)
+
+        settings_form = QtWidgets.QGridLayout()
+        settings_form.addWidget(QtWidgets.QLabel("Quality"), 0, 0)
+        settings_form.addWidget(self.res_combo, 0, 1)
+        settings_form.addWidget(QtWidgets.QLabel("Video Bitrate"), 0, 2)
+        settings_form.addWidget(self.bitrate_edit, 0, 3)
+        settings_form.addWidget(QtWidgets.QLabel("Buffer Size"), 1, 2)
+        settings_form.addWidget(self.bufsize_edit, 1, 3)
+        settings_layout.addLayout(settings_form)
 
         toggles = QtWidgets.QHBoxLayout()
         toggles.addWidget(self.overlay_chk)
@@ -582,27 +603,27 @@ class MainWindow(QtWidgets.QWidget):
         toggles.addWidget(self.logfile_chk)
         toggles.addStretch(1)
         toggles.addWidget(self.console_chk)
+        settings_layout.addLayout(toggles)
 
         bottom_opts = QtWidgets.QHBoxLayout()
         bottom_opts.addWidget(self.remember_chk)
         bottom_opts.addStretch(1)
+        settings_layout.addLayout(bottom_opts)
 
-        btns = QtWidgets.QHBoxLayout()
-        btns.addWidget(self.start_btn)
-        btns.addWidget(self.stop_btn)
-        btns.addWidget(self.skip_btn)
-        btns.addStretch(1)
+        settings_layout.addStretch(1)
+        tabs.addTab(settings_tab, "Settings")
 
-        v = QtWidgets.QVBoxLayout(self)
-        header = QtWidgets.QLabel("Loop your public YouTube VOD playlist to YouTube Live 24/7. Auto-encoder picks NVENC/QSV/AMF/x264.")
-        header.setWordWrap(True)
-        header.setStyleSheet("font-size:14px; color:#b9c2cf;")
-        v.addWidget(header)
-        v.addLayout(form)
-        v.addLayout(toggles)
-        v.addLayout(bottom_opts)
-        v.addLayout(btns)
-        v.addWidget(self.console, 1)
+        # About Tab
+        about_tab = QtWidgets.QWidget()
+        about_layout = QtWidgets.QVBoxLayout(about_tab)
+        about_text = QtWidgets.QLabel(f"<b>{APP_NAME}</b>\nVersion 1.1.1\n\nOpen-source tool created by TheDoctorTTV, stream your YouTube playlists 24/7.")
+        about_text.setWordWrap(True)
+        about_layout.addWidget(about_text)
+        about_layout.addStretch(1)
+        tabs.addTab(about_tab, "About")
+
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.addWidget(tabs)
 
         # Signals
         self.start_btn.clicked.connect(self.on_start)
@@ -854,6 +875,7 @@ def main():
     w = MainWindow()
     w.setWindowIcon(icon)    # title-bar icon
     w.resize(980, 700)
+    w.setMaximumSize(1280, 900)
     w.show()
     sys.exit(app.exec())
 
