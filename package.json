@@ -1,0 +1,13 @@
+{
+  "name": "stream247-electron",
+  "version": "0.1.0",
+  "description": "Stream247 rewritten with a React UI and Electron shell",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node -e \"console.log('No tests specified')\""
+  },
+  "devDependencies": {
+    "electron": "^28.0.0"
+  }
+}

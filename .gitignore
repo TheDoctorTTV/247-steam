@@ -180,7 +180,8 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 *.txt
-*.json
+config.json
 ffmpeg.exe
 yt-dlp.exe
 Flow_Background.mp4
+
