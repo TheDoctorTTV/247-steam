@@ -513,6 +513,7 @@ class MainWindow(QtWidgets.QWidget):
         self.worker_thread: Optional[QtCore.QThread] = None
         self.worker: Optional[StreamWorker] = None
         self.streaming = False
+        self.log_fh = None
 
         # Inputs
         self.playlist_edit = QtWidgets.QLineEdit("")
@@ -532,6 +533,7 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay_chk = QtWidgets.QCheckBox("Overlay current VOD title")
         self.overlay_chk.setChecked(True)
         self.shuffle_chk = QtWidgets.QCheckBox("Shuffle playlist order")
+        self.logfile_chk = QtWidgets.QCheckBox("Log to file")
         self.console_chk = QtWidgets.QCheckBox("Show console")
         self.console_chk.setChecked(True)
         self.remember_chk = QtWidgets.QCheckBox("Save playlist and key")
@@ -569,6 +571,7 @@ class MainWindow(QtWidgets.QWidget):
         toggles = QtWidgets.QHBoxLayout()
         toggles.addWidget(self.overlay_chk)
         toggles.addWidget(self.shuffle_chk)
+        toggles.addWidget(self.logfile_chk)
         toggles.addStretch(1)
         toggles.addWidget(self.console_chk)
 
@@ -605,6 +608,7 @@ class MainWindow(QtWidgets.QWidget):
         self.remember_chk.toggled.connect(lambda _: self.save_settings())
         self.overlay_chk.toggled.connect(lambda _: self.save_settings())
         self.shuffle_chk.toggled.connect(lambda _: self.save_settings())
+        self.logfile_chk.toggled.connect(lambda _: self.save_settings())
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
@@ -625,6 +629,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self.overlay_chk.setChecked(bool(cfg.get("overlay_titles", True)))
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
+        self.logfile_chk.setChecked(bool(cfg.get("log_to_file", False)))
         self.font_edit.setText(cfg.get("fontfile", default_font_path()))
 
         if "quality" in cfg:
@@ -642,6 +647,7 @@ class MainWindow(QtWidgets.QWidget):
             "remember": self.remember_chk.isChecked(),
             "overlay_titles": self.overlay_chk.isChecked(),
             "shuffle": self.shuffle_chk.isChecked(),
+            "log_to_file": self.logfile_chk.isChecked(),
             "quality": self.res_combo.currentText(),
             "video_bitrate": self.bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
@@ -663,6 +669,12 @@ class MainWindow(QtWidgets.QWidget):
     def append_log(self, text: str):
         self.console.append(text)
         self.console.moveCursor(QtGui.QTextCursor.End)
+        if self.log_fh:
+            try:
+                self.log_fh.write(text + "\n")
+                self.log_fh.flush()
+            except Exception:
+                pass
 
     def on_browse_font(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -737,6 +749,22 @@ class MainWindow(QtWidgets.QWidget):
         # save settings right when starting (if 'remember' is checked)
         self.save_settings()
 
+        if self.log_fh:
+            try:
+                self.log_fh.close()
+            except Exception:
+                pass
+            self.log_fh = None
+        if self.logfile_chk.isChecked():
+            log_path = _app_dir() / "latest.log"
+            try:
+                if log_path.exists():
+                    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                    log_path.rename(log_path.with_name(f"{log_path.stem}-{ts}{log_path.suffix}"))
+                self.log_fh = log_path.open("w", encoding="utf-8")
+            except Exception:
+                self.log_fh = None
+
         self.streaming = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -787,6 +815,12 @@ class MainWindow(QtWidgets.QWidget):
 
     def on_finished(self):
         self.append_log("[INFO] Worker finished.")
+        if self.log_fh:
+            try:
+                self.log_fh.close()
+            except Exception:
+                pass
+            self.log_fh = None
         try:
             if self.worker_thread:
                 self.worker_thread.quit()
