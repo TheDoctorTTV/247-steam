@@ -10,14 +10,6 @@ import os, sys, time, json, random, shutil, subprocess, threading, datetime
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from pathlib import Path
-import sys, os
-
-def resource_path(relpath: str) -> str:
-    """Return path to bundled resource, working for PyInstaller --onefile and source runs."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
-    return os.path.join(base, relpath)
-
-
 from PySide6 import QtCore, QtGui, QtWidgets
 
 APP_NAME = "Stream247"
@@ -54,10 +46,10 @@ def save_config_json(data: dict) -> None:
 
 # ---------- misc utilities ----------
 def resource_path(name: str) -> str:
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        p = Path(sys._MEIPASS) / name  # type: ignore[attr-defined]
-        if p.exists():
-            return str(p)
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
+    p = Path(base) / name
+    if p.exists():
+        return str(p)
     return str(Path.cwd() / name)
 
 def find_binary(candidates: List[str]) -> Optional[str]:
