@@ -135,6 +135,7 @@ class StreamConfig:
     sleep_between: int = 3
     fontfile: str = r"C:\Windows\Fonts\arial.ttf"
     title_file: str = "current_title.txt"
+    bumper_path: str = ""
 
     # runtime-selected
     encoder: str = "libx264"
@@ -353,6 +354,37 @@ class StreamWorker(QtCore.QObject):
         except Exception:
             pass
 
+    def run_bumper(self):
+        path = self.cfg.bumper_path
+        if not path:
+            return
+        self.log.emit(f"[INFO] Playing bumper: {path}")
+        prev_overlay = self.cfg.overlay_titles
+        self.cfg.overlay_titles = False
+        ff_cmd = self.build_ffmpeg_cmd(path, None)
+        self.cfg.overlay_titles = prev_overlay
+        self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
+        self.ff_proc = subprocess.Popen(
+            ff_cmd,
+            stdin=None,
+            stdout=None,
+            stderr=None,
+            startupinfo=STARTUPINFO,
+            creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        )
+        while self.ff_proc and self.ff_proc.poll() is None and not self._stop.is_set():
+            time.sleep(0.2)
+        if self._stop.is_set() and self.ff_proc and self.ff_proc.poll() is None:
+            try:
+                self.ff_proc.kill()
+            except Exception:
+                pass
+        try:
+            if self.ff_proc:
+                self.ff_proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
     # ---------- main loop ----------
     @QtCore.Slot()
     def run(self):
@@ -399,6 +431,10 @@ class StreamWorker(QtCore.QObject):
                     except Exception as e:
                         self.log.emit(f"[WARN] Stream error: {e}")
 
+                    if self._stop.is_set():
+                        break
+                    if self.cfg.bumper_path:
+                        self.run_bumper()
                     if self._stop.is_set():
                         break
                     if self.cfg.sleep_between > 0:
@@ -470,6 +506,8 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo.addItems(["720p30", "720p60", "1080p30"])
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
+        self.bumper_edit = QtWidgets.QLineEdit("")
+        self.browse_btn = QtWidgets.QPushButton("Browse…")
 
         self.overlay_chk = QtWidgets.QCheckBox("Overlay current VOD title")
         self.overlay_chk.setChecked(True)
@@ -502,6 +540,10 @@ class MainWindow(QtWidgets.QWidget):
         form.addWidget(QtWidgets.QLabel("Buffer Size"), 3, 2)
         form.addWidget(self.bufsize_edit, 3, 3)
 
+        form.addWidget(QtWidgets.QLabel("Bumper Video"), 4, 0)
+        form.addWidget(self.bumper_edit, 4, 1, 1, 2)
+        form.addWidget(self.browse_btn, 4, 3)
+
         toggles = QtWidgets.QHBoxLayout()
         toggles.addWidget(self.overlay_chk)
         toggles.addWidget(self.shuffle_chk)
@@ -533,6 +575,7 @@ class MainWindow(QtWidgets.QWidget):
         self.stop_btn.clicked.connect(self.on_stop)
         self.console_chk.toggled.connect(self.console.setVisible)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
+        self.browse_btn.clicked.connect(self.on_browse_bumper)
 
         # persist as you tweak
         self.remember_chk.toggled.connect(lambda _: self.save_settings())
@@ -541,6 +584,7 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
+        self.bumper_edit.textChanged.connect(lambda _: self.save_settings())
 
         self.on_quality_change()
         self.load_settings()
@@ -568,6 +612,8 @@ class MainWindow(QtWidgets.QWidget):
             self.bitrate_edit.setText(cfg["video_bitrate"])
         if "bufsize" in cfg:
             self.bufsize_edit.setText(cfg["bufsize"])
+        if "bumper_path" in cfg:
+            self.bumper_edit.setText(cfg["bumper_path"])
 
     def save_settings(self):
         data = load_config_json()
@@ -578,6 +624,7 @@ class MainWindow(QtWidgets.QWidget):
             "quality": self.res_combo.currentText(),
             "video_bitrate": self.bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
+            "bumper_path": self.bumper_edit.text().strip(),
         })
         if self.remember_chk.isChecked():
             data["playlist_url"] = self.playlist_edit.text().strip()
@@ -595,6 +642,17 @@ class MainWindow(QtWidgets.QWidget):
     def append_log(self, text: str):
         self.console.append(text)
         self.console.moveCursor(QtGui.QTextCursor.End)
+
+    def on_browse_bumper(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select bumper video",
+            "",
+            "Video Files (*.mp4 *.mkv *.mov *.avi);;All Files (*)",
+        )
+        if path:
+            self.bumper_edit.setText(path)
+            self.save_settings()
 
     def on_quality_change(self):
         choice = self.res_combo.currentText()
@@ -625,6 +683,7 @@ class MainWindow(QtWidgets.QWidget):
             sleep_between=3,
             fontfile=r"C:\Windows\Fonts\arial.ttf",
             title_file="current_title.txt",
+            bumper_path=self.bumper_edit.text().strip(),
         )
 
     # --- start/stop wiring ---
