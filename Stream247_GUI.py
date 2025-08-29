@@ -639,6 +639,10 @@ class MainWindow(QtWidgets.QWidget):
         self.skip_btn.clicked.connect(self.on_skip)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
 
+        # restore persisted settings before wiring save handlers
+        self.on_quality_change()
+        self.load_settings()
+
         # persist as you tweak
         self.remember_chk.toggled.connect(lambda _: self.save_settings())
         self.overlay_chk.toggled.connect(lambda _: self.save_settings())
@@ -647,9 +651,6 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
-
-        self.on_quality_change()
-        self.load_settings()
 
     # --- settings (config.json) ---
     def load_settings(self):
