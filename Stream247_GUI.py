@@ -943,14 +943,18 @@ def main():
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_NAME)
 
-    # honour high‑dpi displays and ensure only a single QApplication exists
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        if hasattr(QtGui.QGuiApplication, "setHighDpiScaleFactorRoundingPolicy"):
+    # Honour high‑dpi displays; ignore if an application already exists
+    if hasattr(QtGui.QGuiApplication, "setHighDpiScaleFactorRoundingPolicy"):
+        try:
             QtGui.QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
                 QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
             )
-        app = QtWidgets.QApplication(sys.argv)
+        except RuntimeError:
+            # A Q(Gui)Application is already running; ignore policy change
+            pass
+
+    # Ensure only a single QApplication exists
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
     # Load .ico (next to EXE when frozen, or cwd when running from source)
     icon = QtGui.QIcon(resource_path("icon.ico"))
