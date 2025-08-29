@@ -6,7 +6,7 @@
 # - Saves config to config.json next to the EXE
 # - Overlay shows: "<TITLE> • <Pretty Date>" with title truncation (date preserved)
 
-import os, sys, time, json, random, shutil, subprocess, threading, datetime
+import os, sys, time, json, random, shutil, subprocess, threading, datetime, tempfile
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from pathlib import Path
@@ -69,23 +69,6 @@ def find_ffmpeg() -> Optional[str]:
 def find_ytdlp() -> Optional[str]:
     return find_binary(["yt-dlp.exe", "yt-dlp"])
 
-def find_video_players() -> List[str]:
-    candidates = [
-        "vlc", "vlc.exe",
-        "mpv", "mpv.exe",
-        "mplayer", "mplayer.exe",
-        "ffplay", "ffplay.exe",
-    ]
-    found: List[str] = []
-    for c in candidates:
-        p = shutil.which(c)
-        if p and p not in found:
-            found.append(p)
-            continue
-        rp = resource_path(c)
-        if Path(rp).exists() and rp not in found:
-            found.append(rp)
-    return found
 
 def run_hidden(cmd: List[str], check=False, capture=True, text=True, timeout=None) -> subprocess.CompletedProcess:
     kwargs = dict(startupinfo=STARTUPINFO, creationflags=CREATE_NO_WINDOW)
@@ -851,19 +834,13 @@ class MainWindow(QtWidgets.QWidget):
 
     def on_test_stream(self):
         cfg = self.make_config()
-        players = find_video_players()
-        if not players:
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "No video players found.")
-            return
-        labels = [Path(p).name for p in players]
-        choice, ok = QtWidgets.QInputDialog.getItem(self, APP_NAME, "Select video player:", labels, 0, False)
-        if not ok or not choice:
-            return
-        player_path = players[labels.index(choice)]
-
         worker = StreamWorker(cfg)
         if not worker.ytdlp_path:
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "yt-dlp.exe not found. Put yt-dlp next to the EXE or in PATH.")
+            QtWidgets.QMessageBox.warning(
+                self,
+                APP_NAME,
+                "yt-dlp.exe not found. Put yt-dlp next to the EXE or in PATH.",
+            )
             return
         ids = worker.get_video_ids(cfg.playlist_url)
         if not ids:
@@ -871,7 +848,15 @@ class MainWindow(QtWidgets.QWidget):
             return
         url = f"https://www.youtube.com/watch?v={ids[0]}"
         try:
-            subprocess.Popen([player_path, url])
+            if IS_WIN:
+                fd, tmp = tempfile.mkstemp(suffix=".url")
+                os.close(fd)
+                safe_write_text(Path(tmp), f"[InternetShortcut]\nURL={url}\n")
+                subprocess.Popen(["rundll32", "shell32.dll,OpenAs_RunDLL", tmp])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", url])
+            else:
+                subprocess.Popen(["xdg-open", url])
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, APP_NAME, f"Failed to launch player: {e}")
 
