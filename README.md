@@ -7,7 +7,7 @@ Stream247 automatically encodes your videos using available hardware acceleratio
 
 * Stream any **public YouTube playlist** directly to YouTube Live  
 * Supports **1080p streaming** (configurable)  
-* Adjustable **bitrate** and **buffer size**  
+* Adjustable **video/audio bitrate**, **buffer size**, and **audio codec**
 * Options to:  
   * Overlay current VOD title  
   * Shuffle playlist order  

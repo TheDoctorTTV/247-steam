@@ -122,6 +122,7 @@ class StreamConfig:
     video_bitrate: str = "2300k"
     bufsize: str = "4600k"
     audio_bitrate: str = "128k"
+    audio_codec: str = "aac"
     overlay_titles: bool = True
     shuffle: bool = False
     sleep_between: int = 0
@@ -303,7 +304,7 @@ class StreamWorker(QtCore.QObject):
             "-r", str(self.cfg.fps), "-g", str(gop), "-keyint_min", str(gop),
             "-b:v", self.cfg.video_bitrate, "-maxrate", self.cfg.video_bitrate, "-bufsize", self.cfg.bufsize,
             "-vf", ",".join(vf),
-            "-c:a", "aac", "-b:a", self.cfg.audio_bitrate, "-ar", "44100", "-ac", "2",
+            "-c:a", self.cfg.audio_codec, "-b:a", self.cfg.audio_bitrate, "-ar", "44100", "-ac", "2",
             "-f", "flv", self.cfg.rtmp_url()
         ]
         return cmd
@@ -512,6 +513,10 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo.addItems(["480p30", "480p60", "720p30", "720p60", "1080p30", "1080p60"])
         self.res_combo.setCurrentText("720p30")
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
+        self.audio_codec_combo = QtWidgets.QComboBox()
+        self.audio_codec_combo.addItems(["aac", "libopus", "libmp3lame"])
+        self.audio_codec_combo.setCurrentText("aac")
+        self.audio_bitrate_edit = QtWidgets.QLineEdit("128k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
         self.bumper_edit = QtWidgets.QLineEdit("")
         self.browse_btn = QtWidgets.QPushButton("Browse…")
@@ -545,13 +550,17 @@ class MainWindow(QtWidgets.QWidget):
         form.addWidget(self.res_combo, 2, 1)
         form.addWidget(QtWidgets.QLabel("Video Bitrate"), 2, 2)
         form.addWidget(self.bitrate_edit, 2, 3)
+        form.addWidget(QtWidgets.QLabel("Audio Codec"), 3, 0)
+        form.addWidget(self.audio_codec_combo, 3, 1)
+        form.addWidget(QtWidgets.QLabel("Audio Bitrate"), 3, 2)
+        form.addWidget(self.audio_bitrate_edit, 3, 3)
 
-        form.addWidget(QtWidgets.QLabel("Buffer Size"), 3, 2)
-        form.addWidget(self.bufsize_edit, 3, 3)
+        form.addWidget(QtWidgets.QLabel("Buffer Size"), 4, 2)
+        form.addWidget(self.bufsize_edit, 4, 3)
 
-        form.addWidget(QtWidgets.QLabel("Bumper Video"), 4, 0)
-        form.addWidget(self.bumper_edit, 4, 1, 1, 2)
-        form.addWidget(self.browse_btn, 4, 3)
+        form.addWidget(QtWidgets.QLabel("Bumper Video"), 5, 0)
+        form.addWidget(self.bumper_edit, 5, 1, 1, 2)
+        form.addWidget(self.browse_btn, 5, 3)
 
         toggles = QtWidgets.QHBoxLayout()
         toggles.addWidget(self.overlay_chk)
@@ -594,6 +603,8 @@ class MainWindow(QtWidgets.QWidget):
         self.shuffle_chk.toggled.connect(lambda _: self.save_settings())
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
+        self.audio_codec_combo.currentIndexChanged.connect(lambda _: self.save_settings())
+        self.audio_bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
         self.bumper_edit.textChanged.connect(lambda _: self.save_settings())
 
@@ -619,6 +630,12 @@ class MainWindow(QtWidgets.QWidget):
                 self.res_combo.setCurrentIndex(idx)
         if "video_bitrate" in cfg:
             self.bitrate_edit.setText(cfg["video_bitrate"])
+        if "audio_bitrate" in cfg:
+            self.audio_bitrate_edit.setText(cfg["audio_bitrate"])
+        if "audio_codec" in cfg:
+            idx = self.audio_codec_combo.findText(cfg["audio_codec"])
+            if idx >= 0:
+                self.audio_codec_combo.setCurrentIndex(idx)
         if "bufsize" in cfg:
             self.bufsize_edit.setText(cfg["bufsize"])
         if "bumper_path" in cfg:
@@ -632,6 +649,8 @@ class MainWindow(QtWidgets.QWidget):
             "shuffle": self.shuffle_chk.isChecked(),
             "quality": self.res_combo.currentText(),
             "video_bitrate": self.bitrate_edit.text().strip(),
+            "audio_codec": self.audio_codec_combo.currentText().strip(),
+            "audio_bitrate": self.audio_bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
             "bumper_path": self.bumper_edit.text().strip(),
         })
@@ -698,7 +717,8 @@ class MainWindow(QtWidgets.QWidget):
             height=self._height,
             video_bitrate=self.bitrate_edit.text().strip(),
             bufsize=self.bufsize_edit.text().strip(),
-            audio_bitrate="128k",
+            audio_bitrate=self.audio_bitrate_edit.text().strip(),
+            audio_codec=self.audio_codec_combo.currentText().strip(),
             overlay_titles=self.overlay_chk.isChecked(),
             shuffle=self.shuffle_chk.isChecked(),
             sleep_between=0,
