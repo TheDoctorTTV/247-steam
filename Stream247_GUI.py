@@ -867,8 +867,7 @@ def main():
     app.setStyleSheet(DARK_QSS)
     w = MainWindow()
     w.setWindowIcon(icon)    # title-bar icon
-    w.resize(980, 700)
-    w.setMaximumSize(1280, 900)
+    w.setFixedSize(1280, 300)
     w.show()
     sys.exit(app.exec())
 
