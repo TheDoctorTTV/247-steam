@@ -97,3 +97,48 @@ body {
     background-color: var(--button-hover-bg);
     box-shadow: 0 0 20px var(--card-shadow);
 }
+
+/* Tabs */
+.tabs {
+    display: flex;
+    margin-bottom: 1rem;
+}
+
+.tab {
+    flex: 1;
+    padding: 0.5rem;
+    background: var(--button-bg);
+    border: none;
+    color: #fff;
+    cursor: pointer;
+    width: auto;
+}
+
+.tab:not(:last-child) {
+    margin-right: 0.25rem;
+}
+
+.tab.active {
+    background: var(--button-hover-bg);
+}
+
+.tab-content button {
+    margin-bottom: 0.5rem;
+}
+
+.tab-content.console {
+    background: var(--background-color);
+    padding: 0.5rem;
+    border: 1px solid var(--border-color);
+    min-height: 100px;
+}
+
+/* Select inputs */
+.app select {
+    padding: 0.75rem;
+    font-size: var(--font-size-base);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--background-color);
+    color: var(--text-color);
+}
