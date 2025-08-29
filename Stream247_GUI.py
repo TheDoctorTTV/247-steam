@@ -515,10 +515,12 @@ class MainWindow(QtWidgets.QWidget):
     QUALITY_PRESETS = {
         "480p30": (30, 480, "1000k", "2000k"),
         "480p60": (60, 480, "1500k", "3000k"),
-        "720p30": (30, 720, "2300k", "4600k"),
-        "720p60": (60, 720, "3200k", "6400k"),
-        "1080p30": (30, 1080, "4500k", "9000k"),
-        "1080p60": (60, 1080, "6000k", "12000k"),
+        "720p30": (30, 720, "3000k", "4600k"),
+        "720p60": (60, 720, "6000k", "6400k"),
+        "1080p30": (30, 1080, "10000k", "9000k"),
+        "1080p60": (60, 1080, "12000k", "12000k"),
+        "1440p60": (60, 1440, "3500k", "12000k"),
+        "2160p60": (60, 2160, "35000k", "12000k")
     }
 
     stopRequested = QtCore.Signal()
@@ -543,7 +545,7 @@ class MainWindow(QtWidgets.QWidget):
         self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
 
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["480p30", "480p60", "720p30", "720p60", "1080p30", "1080p60"])
+        self.res_combo.addItems(["480p30", "480p60", "720p30", "720p60", "1080p30", "1080p60", "1440p60", "2160p60"])
         self.res_combo.setCurrentText("720p30")
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
