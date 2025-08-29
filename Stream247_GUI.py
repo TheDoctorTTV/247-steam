@@ -69,6 +69,24 @@ def find_ffmpeg() -> Optional[str]:
 def find_ytdlp() -> Optional[str]:
     return find_binary(["yt-dlp.exe", "yt-dlp"])
 
+def find_video_players() -> List[str]:
+    candidates = [
+        "vlc", "vlc.exe",
+        "mpv", "mpv.exe",
+        "mplayer", "mplayer.exe",
+        "ffplay", "ffplay.exe",
+    ]
+    found: List[str] = []
+    for c in candidates:
+        p = shutil.which(c)
+        if p and p not in found:
+            found.append(p)
+            continue
+        rp = resource_path(c)
+        if Path(rp).exists() and rp not in found:
+            found.append(rp)
+    return found
+
 def run_hidden(cmd: List[str], check=False, capture=True, text=True, timeout=None) -> subprocess.CompletedProcess:
     kwargs = dict(startupinfo=STARTUPINFO, creationflags=CREATE_NO_WINDOW)
     if capture:
@@ -391,6 +409,8 @@ class StreamWorker(QtCore.QObject):
         path = self.cfg.bumper_path
         if not path:
             return
+        # ensure previous skip requests don't kill the bumper immediately
+        self._skip.clear()
         self.log.emit(f"[INFO] Playing bumper: {path}")
         prev_overlay = self.cfg.overlay_titles
         self.cfg.overlay_titles = False
@@ -566,6 +586,7 @@ class MainWindow(QtWidgets.QWidget):
         self.stop_btn.setEnabled(False)
         self.skip_btn = QtWidgets.QPushButton("Skip Video")
         self.skip_btn.setEnabled(False)
+        self.test_btn = QtWidgets.QPushButton("Test Stream")
 
         # Layout
         form = QtWidgets.QGridLayout()
@@ -604,6 +625,7 @@ class MainWindow(QtWidgets.QWidget):
         btns.addWidget(self.start_btn)
         btns.addWidget(self.stop_btn)
         btns.addWidget(self.skip_btn)
+        btns.addWidget(self.test_btn)
         btns.addStretch(1)
 
         v = QtWidgets.QVBoxLayout(self)
@@ -621,6 +643,7 @@ class MainWindow(QtWidgets.QWidget):
         self.start_btn.clicked.connect(self.on_start)
         self.stop_btn.clicked.connect(self.on_stop)
         self.skip_btn.clicked.connect(self.on_skip)
+        self.test_btn.clicked.connect(self.on_test_stream)
         self.console_chk.toggled.connect(self.on_console_toggle)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
         self.browse_btn.clicked.connect(self.on_browse_bumper)
@@ -825,6 +848,32 @@ class MainWindow(QtWidgets.QWidget):
             self.worker.skip()
         except Exception:
             pass
+
+    def on_test_stream(self):
+        cfg = self.make_config()
+        players = find_video_players()
+        if not players:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "No video players found.")
+            return
+        labels = [Path(p).name for p in players]
+        choice, ok = QtWidgets.QInputDialog.getItem(self, APP_NAME, "Select video player:", labels, 0, False)
+        if not ok or not choice:
+            return
+        player_path = players[labels.index(choice)]
+
+        worker = StreamWorker(cfg)
+        if not worker.ytdlp_path:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "yt-dlp.exe not found. Put yt-dlp next to the EXE or in PATH.")
+            return
+        ids = worker.get_video_ids(cfg.playlist_url)
+        if not ids:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "No videos found in playlist.")
+            return
+        url = f"https://www.youtube.com/watch?v={ids[0]}"
+        try:
+            subprocess.Popen([player_path, url])
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, f"Failed to launch player: {e}")
 
     def on_finished(self):
         self.append_log("[INFO] Worker finished.")
