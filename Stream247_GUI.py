@@ -362,11 +362,32 @@ class StreamWorker(QtCore.QObject):
         self.ff_proc = subprocess.Popen(
             ff_cmd,
             stdin=None,
-            stdout=None,
-            stderr=None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
             startupinfo=STARTUPINFO,
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         )
+
+        def _reader(stream):
+            try:
+                for line in iter(stream.readline, ""):
+                    self.log.emit(line.rstrip())
+            finally:
+                stream.close()
+
+        readers = []
+        if self.ff_proc.stdout:
+            t = threading.Thread(target=_reader, args=(self.ff_proc.stdout,))
+            t.daemon = True
+            t.start()
+            readers.append(t)
+        if self.ff_proc.stderr:
+            t = threading.Thread(target=_reader, args=(self.ff_proc.stderr,))
+            t.daemon = True
+            t.start()
+            readers.append(t)
 
         while self.ff_proc and self.ff_proc.poll() is None and not (
             self._stop.is_set() or self._skip.is_set()
@@ -384,6 +405,9 @@ class StreamWorker(QtCore.QObject):
                 self.ff_proc.wait(timeout=1.0)
         except Exception:
             pass
+
+        for t in readers:
+            t.join(timeout=0.2)
 
 
     # ---------- main loop ----------
