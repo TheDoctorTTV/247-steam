@@ -389,10 +389,12 @@ class StreamWorker(QtCore.QObject):
             readers.append(t)
 
         # Wait until ffmpeg finishes or a stop/skip is requested
-        while self.ff_proc and self.ff_proc.poll() is None and not (
-            self._stop.is_set() or self._skip.is_set()
-        ):
-            time.sleep(0.2)
+        while self.ff_proc and not (self._stop.is_set() or self._skip.is_set()):
+            try:
+                self.ff_proc.wait(timeout=0.2)
+                break  # process finished
+            except subprocess.TimeoutExpired:
+                continue
 
         if (self._stop.is_set() or self._skip.is_set()) and self.ff_proc and self.ff_proc.poll() is None:
             try:
