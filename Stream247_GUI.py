@@ -7,7 +7,7 @@
 # - Overlay shows: "<TITLE> • <Pretty Date>" with title truncation (date preserved)
 
 import os, sys, time, json, random, shutil, subprocess, threading, datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -111,6 +111,29 @@ def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts
         return None
     return dt.strftime("%b %#d, %Y") if IS_WIN else dt.strftime("%b %-d, %Y")
 
+
+def default_font_path() -> str:
+    """Return a reasonable default font path for the current OS."""
+    if IS_WIN:
+        candidates = [
+            r"C:\\Windows\\Fonts\\arial.ttf",
+            r"C:\\Windows\\Fonts\\Arial.ttf",
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+    else:  # Linux and others
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
+    for c in candidates:
+        if Path(c).exists():
+            return c
+    return ""
+
 # ---------- streaming core ----------
 @dataclass
 class StreamConfig:
@@ -125,7 +148,7 @@ class StreamConfig:
     overlay_titles: bool = True
     shuffle: bool = False
     sleep_between: int = 0
-    fontfile: str = r"C:\Windows\Fonts\arial.ttf"
+    fontfile: str = field(default_factory=default_font_path)
     title_file: str = "current_title.txt"
     bumper_path: str = ""
 
@@ -274,12 +297,17 @@ class StreamWorker(QtCore.QObject):
         gop = self.cfg.fps * 2
         vf = [f"scale=-2:{self.cfg.height}:flags=bicubic"]
         if self.cfg.overlay_titles:
-            fontfile = self.cfg.fontfile.replace(":", r"\:")
-            fontsize = getattr(self.cfg, "_overlay_fontsize", 24)
-            vf.append(
-                f"drawtext=fontfile='{fontfile}':textfile='{self.cfg.title_file}':reload=1:"
-                f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
-            )
+            font_path = Path(self.cfg.fontfile)
+            if self.cfg.fontfile and font_path.exists():
+                fontfile = font_path.as_posix().replace(":", r"\:").replace("'", r"\\'")
+                title_file = Path(self.cfg.title_file).as_posix().replace(":", r"\:").replace("'", r"\\'")
+                fontsize = getattr(self.cfg, "_overlay_fontsize", 24)
+                vf.append(
+                    f"drawtext=fontfile='{fontfile}':textfile='{title_file}':reload=1:"
+                    f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
+                )
+            elif self.cfg.fontfile:
+                self.log.emit(f"[WARN] Font file not found: {font_path}")
         vf.append(f"format={self.cfg.pix_fmt}")
 
         cmd = [
@@ -515,6 +543,8 @@ class MainWindow(QtWidgets.QWidget):
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
         self.bumper_edit = QtWidgets.QLineEdit("")
         self.browse_btn = QtWidgets.QPushButton("Browse…")
+        self.font_edit = QtWidgets.QLineEdit(default_font_path())
+        self.font_btn = QtWidgets.QPushButton("Font…")
 
         self.overlay_chk = QtWidgets.QCheckBox("Overlay current VOD title")
         self.overlay_chk.setChecked(True)
@@ -553,6 +583,10 @@ class MainWindow(QtWidgets.QWidget):
         form.addWidget(self.bumper_edit, 4, 1, 1, 2)
         form.addWidget(self.browse_btn, 4, 3)
 
+        form.addWidget(QtWidgets.QLabel("Overlay Font"), 5, 0)
+        form.addWidget(self.font_edit, 5, 1, 1, 2)
+        form.addWidget(self.font_btn, 5, 3)
+
         toggles = QtWidgets.QHBoxLayout()
         toggles.addWidget(self.overlay_chk)
         toggles.addWidget(self.shuffle_chk)
@@ -587,6 +621,7 @@ class MainWindow(QtWidgets.QWidget):
         self.console_chk.toggled.connect(self.console.setVisible)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
         self.browse_btn.clicked.connect(self.on_browse_bumper)
+        self.font_btn.clicked.connect(self.on_browse_font)
 
         # persist as you tweak
         self.remember_chk.toggled.connect(lambda _: self.save_settings())
@@ -596,6 +631,7 @@ class MainWindow(QtWidgets.QWidget):
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
         self.bumper_edit.textChanged.connect(lambda _: self.save_settings())
+        self.font_edit.textChanged.connect(lambda _: self.save_settings())
 
         self.on_quality_change()
         self.load_settings()
@@ -612,6 +648,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self.overlay_chk.setChecked(bool(cfg.get("overlay_titles", True)))
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
+        self.font_edit.setText(cfg.get("fontfile", default_font_path()))
 
         if "quality" in cfg:
             idx = self.res_combo.findText(cfg["quality"])
@@ -634,6 +671,7 @@ class MainWindow(QtWidgets.QWidget):
             "video_bitrate": self.bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
             "bumper_path": self.bumper_edit.text().strip(),
+            "fontfile": self.font_edit.text().strip(),
         })
         if self.remember_chk.isChecked():
             data["playlist_url"] = self.playlist_edit.text().strip()
@@ -661,6 +699,17 @@ class MainWindow(QtWidgets.QWidget):
         )
         if path:
             self.bumper_edit.setText(path)
+            self.save_settings()
+
+    def on_browse_font(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select overlay font",
+            "",
+            "Font Files (*.ttf *.otf *.ttc);;All Files (*)",
+        )
+        if path:
+            self.font_edit.setText(path)
             self.save_settings()
 
     def on_quality_change(self):
@@ -702,7 +751,7 @@ class MainWindow(QtWidgets.QWidget):
             overlay_titles=self.overlay_chk.isChecked(),
             shuffle=self.shuffle_chk.isChecked(),
             sleep_between=0,
-            fontfile=r"C:\Windows\Fonts\arial.ttf",
+            fontfile=self.font_edit.text().strip() or default_font_path(),
             title_file="current_title.txt",
             bumper_path=self.bumper_edit.text().strip(),
         )
