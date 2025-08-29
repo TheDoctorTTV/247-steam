@@ -520,8 +520,7 @@ class MainWindow(QtWidgets.QWidget):
         """Initialise all widgets and connect signals."""
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} — YouTube 24/7 VOD Streamer")
-        # Allow the window to shrink when the console is hidden. Keep a sensible
-        # minimum width, but let the height adjust dynamically.
+        # Keep a sensible minimum width and let the height adjust dynamically.
         self.setMinimumWidth(860)
         self.resize(860, 680)
         self.worker_thread: Optional[QtCore.QThread] = None
@@ -546,8 +545,6 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay_chk.setChecked(True)
         self.shuffle_chk = QtWidgets.QCheckBox("Shuffle playlist order")
         self.logfile_chk = QtWidgets.QCheckBox("Log to file")
-        self.console_chk = QtWidgets.QCheckBox("Show console")
-        self.console_chk.setChecked(True)
         self.remember_chk = QtWidgets.QCheckBox("Save playlist and key")
         self.remember_chk.setChecked(True)
 
@@ -581,8 +578,13 @@ class MainWindow(QtWidgets.QWidget):
         btns.addWidget(self.skip_btn)
         btns.addStretch(1)
         stream_layout.addLayout(btns)
-        stream_layout.addWidget(self.console, 1)
         tabs.addTab(stream_tab, "Stream")
+
+        # Console Tab
+        console_tab = QtWidgets.QWidget()
+        console_layout = QtWidgets.QVBoxLayout(console_tab)
+        console_layout.addWidget(self.console)
+        tabs.addTab(console_tab, "Console")
 
         # Settings Tab
         settings_tab = QtWidgets.QWidget()
@@ -602,7 +604,6 @@ class MainWindow(QtWidgets.QWidget):
         toggles.addWidget(self.shuffle_chk)
         toggles.addWidget(self.logfile_chk)
         toggles.addStretch(1)
-        toggles.addWidget(self.console_chk)
         settings_layout.addLayout(toggles)
 
         bottom_opts = QtWidgets.QHBoxLayout()
@@ -629,7 +630,6 @@ class MainWindow(QtWidgets.QWidget):
         self.start_btn.clicked.connect(self.on_start)
         self.stop_btn.clicked.connect(self.on_stop)
         self.skip_btn.clicked.connect(self.on_skip)
-        self.console_chk.toggled.connect(self.on_console_toggle)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
 
         # persist as you tweak
@@ -704,13 +704,6 @@ class MainWindow(QtWidgets.QWidget):
                 self.log_fh.flush()
             except Exception:
                 pass
-
-    def on_console_toggle(self, checked: bool):
-        """Show or hide the log console without shifting the rest of the UI."""
-        self.console.setVisible(checked)
-        # Collapse the console area when hidden so the window height adjusts
-        self.console.setMaximumHeight(16777215 if checked else 0)
-        self.adjustSize()
 
     def on_quality_change(self):
         """Update internal FPS/height presets when the quality dropdown changes."""
