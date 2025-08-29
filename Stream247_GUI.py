@@ -124,7 +124,7 @@ class StreamConfig:
     audio_bitrate: str = "128k"
     overlay_titles: bool = True
     shuffle: bool = False
-    sleep_between: int = 3
+    sleep_between: int = 0
     fontfile: str = r"C:\Windows\Fonts\arial.ttf"
     title_file: str = "current_title.txt"
     bumper_path: str = ""
@@ -149,6 +149,7 @@ class StreamWorker(QtCore.QObject):
         super().__init__(parent)
         self.cfg = cfg
         self._stop = threading.Event()
+        self._skip = threading.Event()
         self.ffmpeg_path = find_ffmpeg()
         self.ytdlp_path = find_ytdlp()
         self.ff_proc = None
@@ -183,6 +184,15 @@ class StreamWorker(QtCore.QObject):
                         pass
         finally:
             self.ff_proc = None
+
+    def skip(self):
+        self._skip.set()
+        self.log.emit("[INFO] Skip requested — advancing to next item…")
+        try:
+            if self.ff_proc and self.ff_proc.poll() is None:
+                self.ff_proc.kill()
+        except Exception:
+            pass
 
     # ---------- yt-dlp helpers ----------
     def get_video_ids(self, playlist_url: str) -> List[str]:
@@ -321,7 +331,7 @@ class StreamWorker(QtCore.QObject):
         vurl, aurl = self.get_stream_urls(video_id)
         ff_cmd = self.build_ffmpeg_cmd(vurl, aurl)
         self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
-
+        self._skip.clear()
         self.ff_proc = subprocess.Popen(
             ff_cmd,
             stdin=None,
@@ -331,10 +341,12 @@ class StreamWorker(QtCore.QObject):
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         )
 
-        while self.ff_proc and self.ff_proc.poll() is None and not self._stop.is_set():
+        while self.ff_proc and self.ff_proc.poll() is None and not (
+            self._stop.is_set() or self._skip.is_set()
+        ):
             time.sleep(0.2)
 
-        if self._stop.is_set() and self.ff_proc and self.ff_proc.poll() is None:
+        if (self._stop.is_set() or self._skip.is_set()) and self.ff_proc and self.ff_proc.poll() is None:
             try:
                 self.ff_proc.kill()
             except Exception:
@@ -345,6 +357,7 @@ class StreamWorker(QtCore.QObject):
                 self.ff_proc.wait(timeout=1.0)
         except Exception:
             pass
+
 
     def run_bumper(self):
         path = self.cfg.bumper_path
@@ -356,6 +369,7 @@ class StreamWorker(QtCore.QObject):
         ff_cmd = self.build_ffmpeg_cmd(path, None)
         self.cfg.overlay_titles = prev_overlay
         self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
+
         self.ff_proc = subprocess.Popen(
             ff_cmd,
             stdin=None,
@@ -364,9 +378,13 @@ class StreamWorker(QtCore.QObject):
             startupinfo=STARTUPINFO,
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         )
-        while self.ff_proc and self.ff_proc.poll() is None and not self._stop.is_set():
+
+        while self.ff_proc and self.ff_proc.poll() is None and not (
+            self._stop.is_set() or self._skip.is_set()
+        ):
             time.sleep(0.2)
-        if self._stop.is_set() and self.ff_proc and self.ff_proc.poll() is None:
+        if (self._stop.is_set() or self._skip.is_set()) and self.ff_proc and self.ff_proc.poll() is None:
+
             try:
                 self.ff_proc.kill()
             except Exception:
@@ -376,6 +394,7 @@ class StreamWorker(QtCore.QObject):
                 self.ff_proc.wait(timeout=1.0)
         except Exception:
             pass
+
 
     # ---------- main loop ----------
     @QtCore.Slot()
@@ -429,12 +448,7 @@ class StreamWorker(QtCore.QObject):
                         self.run_bumper()
                     if self._stop.is_set():
                         break
-                    if self.cfg.sleep_between > 0:
-                        self.log.emit(f"[INFO] Sleeping {self.cfg.sleep_between}s…")
-                        for _ in range(self.cfg.sleep_between):
-                            if self._stop.is_set():
-                                break
-                            time.sleep(1)
+
 
                 if self._stop.is_set():
                     break
@@ -495,7 +509,8 @@ class MainWindow(QtWidgets.QWidget):
         self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
 
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["720p30", "720p60", "1080p30"])
+        self.res_combo.addItems(["480p30", "480p60", "720p30", "720p60", "1080p30", "1080p60"])
+        self.res_combo.setCurrentText("720p30")
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
         self.bumper_edit = QtWidgets.QLineEdit("")
@@ -516,6 +531,8 @@ class MainWindow(QtWidgets.QWidget):
         self.start_btn = QtWidgets.QPushButton("Start Stream")
         self.stop_btn = QtWidgets.QPushButton("Stop Stream")
         self.stop_btn.setEnabled(False)
+        self.skip_btn = QtWidgets.QPushButton("Skip Video")
+        self.skip_btn.setEnabled(False)
 
         # Layout
         form = QtWidgets.QGridLayout()
@@ -549,6 +566,7 @@ class MainWindow(QtWidgets.QWidget):
         btns = QtWidgets.QHBoxLayout()
         btns.addWidget(self.start_btn)
         btns.addWidget(self.stop_btn)
+        btns.addWidget(self.skip_btn)
         btns.addStretch(1)
 
         v = QtWidgets.QVBoxLayout(self)
@@ -565,6 +583,7 @@ class MainWindow(QtWidgets.QWidget):
         # Signals
         self.start_btn.clicked.connect(self.on_start)
         self.stop_btn.clicked.connect(self.on_stop)
+        self.skip_btn.clicked.connect(self.on_skip)
         self.console_chk.toggled.connect(self.console.setVisible)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
         self.browse_btn.clicked.connect(self.on_browse_bumper)
@@ -646,7 +665,15 @@ class MainWindow(QtWidgets.QWidget):
 
     def on_quality_change(self):
         choice = self.res_combo.currentText()
-        if "720p30" in choice:
+        if "480p30" in choice:
+            self._fps = 30; self._height = 480
+            if not self.streaming:
+                self.bitrate_edit.setText("1000k"); self.bufsize_edit.setText("2000k")
+        elif "480p60" in choice:
+            self._fps = 60; self._height = 480
+            if not self.streaming:
+                self.bitrate_edit.setText("1500k"); self.bufsize_edit.setText("3000k")
+        elif "720p30" in choice:
             self._fps = 30; self._height = 720
             if not self.streaming:
                 self.bitrate_edit.setText("2300k"); self.bufsize_edit.setText("4600k")
@@ -654,10 +681,14 @@ class MainWindow(QtWidgets.QWidget):
             self._fps = 60; self._height = 720
             if not self.streaming:
                 self.bitrate_edit.setText("3200k"); self.bufsize_edit.setText("6400k")
-        else:  # 1080p30
+        elif "1080p30" in choice:
             self._fps = 30; self._height = 1080
             if not self.streaming:
                 self.bitrate_edit.setText("4500k"); self.bufsize_edit.setText("9000k")
+        else:  # 1080p60
+            self._fps = 60; self._height = 1080
+            if not self.streaming:
+                self.bitrate_edit.setText("6000k"); self.bufsize_edit.setText("12000k")
 
     def make_config(self) -> StreamConfig:
         return StreamConfig(
@@ -670,7 +701,7 @@ class MainWindow(QtWidgets.QWidget):
             audio_bitrate="128k",
             overlay_titles=self.overlay_chk.isChecked(),
             shuffle=self.shuffle_chk.isChecked(),
-            sleep_between=3,
+            sleep_between=0,
             fontfile=r"C:\Windows\Fonts\arial.ttf",
             title_file="current_title.txt",
             bumper_path=self.bumper_edit.text().strip(),
@@ -691,6 +722,7 @@ class MainWindow(QtWidgets.QWidget):
         self.streaming = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.skip_btn.setEnabled(True)
         self.append_log("[INFO] Starting stream…")
 
         self.worker_thread = QtCore.QThread(self)
@@ -724,6 +756,16 @@ class MainWindow(QtWidgets.QWidget):
 
         # Do not quit the thread here; let on_finished() handle cleanup
         self.stop_btn.setEnabled(False)
+        self.skip_btn.setEnabled(False)
+
+    def on_skip(self):
+        if not self.streaming or not self.worker:
+            return
+        self.append_log("[INFO] Skipping…")
+        try:
+            self.worker.skip()
+        except Exception:
+            pass
 
     def on_finished(self):
         self.append_log("[INFO] Worker finished.")
@@ -738,6 +780,7 @@ class MainWindow(QtWidgets.QWidget):
         self.streaming = False
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.skip_btn.setEnabled(False)
 
 # ---------- entry ----------
 def main():
