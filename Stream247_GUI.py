@@ -173,47 +173,48 @@ class StreamWorker(QtCore.QObject):
         self.ytdlp_path = find_ytdlp()
         self.ff_proc = None
 
+    def _terminate_ff_proc(self) -> None:
+        """Attempt to gracefully terminate any running ffmpeg process."""
+        proc = self.ff_proc
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        if IS_WIN and proc.poll() is None:
+            for cmd in (
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                ["taskkill", "/IM", "ffmpeg.exe", "/T", "/F"],
+            ):
+                try:
+                    run_hidden(cmd, capture=False)
+                except Exception:
+                    pass
+                if proc.poll() is not None:
+                    break
+
     # ---------- control ----------
     def stop(self):
         """Request the current ffmpeg process to terminate."""
         self._stop.set()
         self.log.emit("[INFO] Stop requested — killing ffmpeg…")
-        try:
-            if self.ff_proc and self.ff_proc.poll() is None:
-                try:
-                    self.ff_proc.terminate()
-                    self.ff_proc.wait(timeout=1.0)
-                except Exception:
-                    pass
-                if self.ff_proc and self.ff_proc.poll() is None:
-                    try:
-                        self.ff_proc.kill()
-                        self.ff_proc.wait(timeout=1.0)
-                    except Exception:
-                        pass
-                if IS_WIN and self.ff_proc and self.ff_proc.poll() is None:
-                    try:
-                        run_hidden(["taskkill", "/PID", str(self.ff_proc.pid), "/T", "/F"], capture=False)
-                    except Exception:
-                        pass
-                if IS_WIN and self.ff_proc and self.ff_proc.poll() is None:
-                    self.log.emit("[WARN] Aggressive kill: taskkill /IM ffmpeg.exe /T /F")
-                    try:
-                        run_hidden(["taskkill", "/IM", "ffmpeg.exe", "/T", "/F"], capture=False)
-                    except Exception:
-                        pass
-        finally:
-            self.ff_proc = None
+        self._terminate_ff_proc()
+        self.ff_proc = None
 
     def skip(self):
         """Abort the current video and advance to the next."""
         self._skip.set()
         self.log.emit("[INFO] Skip requested — advancing to next item…")
-        try:
-            if self.ff_proc and self.ff_proc.poll() is None:
-                self.ff_proc.kill()
-        except Exception:
-            pass
+        self._terminate_ff_proc()
+        self.ff_proc = None
 
     # ---------- yt-dlp helpers ----------
     def get_video_ids(self, playlist_url: str) -> List[str]:
@@ -393,18 +394,14 @@ class StreamWorker(QtCore.QObject):
             self._stop.is_set() or self._skip.is_set()
         ):
             time.sleep(0.2)
-
-        if (self._stop.is_set() or self._skip.is_set()) and self.ff_proc and self.ff_proc.poll() is None:
+        if self._stop.is_set() or self._skip.is_set():
+            self._terminate_ff_proc()
+        else:
             try:
-                self.ff_proc.kill()
+                if self.ff_proc:
+                    self.ff_proc.wait(timeout=1.0)
             except Exception:
                 pass
-
-        try:
-            if self.ff_proc:
-                self.ff_proc.wait(timeout=1.0)
-        except Exception:
-            pass
 
         for t in readers:
             t.join(timeout=0.2)
@@ -418,6 +415,7 @@ class StreamWorker(QtCore.QObject):
                         for line in leftover.splitlines():
                             self.log.emit(line.rstrip())
                     stream.close()
+            self.ff_proc = None
 
 
     # ---------- main loop ----------
@@ -514,6 +512,17 @@ QCheckBox::indicator:unchecked {
 class MainWindow(QtWidgets.QWidget):
     """Main application window housing the GUI and controls."""
 
+    QUALITY_PRESETS = {
+        "480p30": (30, 480, "1000k", "2000k"),
+        "480p60": (60, 480, "1500k", "3000k"),
+        "720p30": (30, 720, "3000k", "4600k"),
+        "720p60": (60, 720, "6000k", "6400k"),
+        "1080p30": (30, 1080, "10000k", "9000k"),
+        "1080p60": (60, 1080, "12000k", "12000k"),
+        "1440p60": (60, 1440, "3500k", "12000k"),
+        "2160p60": (60, 2160, "35000k", "12000k")
+    }
+
     stopRequested = QtCore.Signal()
 
     def __init__(self):
@@ -536,7 +545,7 @@ class MainWindow(QtWidgets.QWidget):
         self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
 
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["480p30", "480p60", "720p30", "720p60", "1080p30", "1080p60"])
+        self.res_combo.addItems(["480p30", "480p60", "720p30", "720p60", "1080p30", "1080p60", "1440p60", "2160p60"])
         self.res_combo.setCurrentText("720p30")
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
@@ -632,6 +641,10 @@ class MainWindow(QtWidgets.QWidget):
         self.skip_btn.clicked.connect(self.on_skip)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
 
+        # restore persisted settings before wiring save handlers
+        self.on_quality_change()
+        self.load_settings()
+
         # persist as you tweak
         self.remember_chk.toggled.connect(lambda _: self.save_settings())
         self.overlay_chk.toggled.connect(lambda _: self.save_settings())
@@ -640,9 +653,6 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
-
-        self.on_quality_change()
-        self.load_settings()
 
     # --- settings (config.json) ---
     def load_settings(self):
@@ -708,30 +718,14 @@ class MainWindow(QtWidgets.QWidget):
     def on_quality_change(self):
         """Update internal FPS/height presets when the quality dropdown changes."""
         choice = self.res_combo.currentText()
-        if "480p30" in choice:
-            self._fps = 30; self._height = 480
-            if not self.streaming:
-                self.bitrate_edit.setText("1000k"); self.bufsize_edit.setText("2000k")
-        elif "480p60" in choice:
-            self._fps = 60; self._height = 480
-            if not self.streaming:
-                self.bitrate_edit.setText("1500k"); self.bufsize_edit.setText("3000k")
-        elif "720p30" in choice:
-            self._fps = 30; self._height = 720
-            if not self.streaming:
-                self.bitrate_edit.setText("2300k"); self.bufsize_edit.setText("4600k")
-        elif "720p60" in choice:
-            self._fps = 60; self._height = 720
-            if not self.streaming:
-                self.bitrate_edit.setText("3200k"); self.bufsize_edit.setText("6400k")
-        elif "1080p30" in choice:
-            self._fps = 30; self._height = 1080
-            if not self.streaming:
-                self.bitrate_edit.setText("4500k"); self.bufsize_edit.setText("9000k")
-        else:  # 1080p60
-            self._fps = 60; self._height = 1080
-            if not self.streaming:
-                self.bitrate_edit.setText("6000k"); self.bufsize_edit.setText("12000k")
+        fps, height, bitrate, bufsize = self.QUALITY_PRESETS.get(
+            choice, self.QUALITY_PRESETS["1080p60"]
+        )
+        self._fps = fps
+        self._height = height
+        if not self.streaming:
+            self.bitrate_edit.setText(bitrate)
+            self.bufsize_edit.setText(bufsize)
 
     def make_config(self) -> StreamConfig:
         """Create a StreamConfig from the current UI state."""
