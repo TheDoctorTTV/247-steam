@@ -603,11 +603,9 @@ class MainWindow(QtWidgets.QWidget):
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
 
         if "quality" in cfg:
-            try:
-                idx = ["720p30 (stable)", "720p60", "1080p30"].index(cfg["quality"])
+            idx = self.res_combo.findText(cfg["quality"])
+            if idx >= 0:
                 self.res_combo.setCurrentIndex(idx)
-            except Exception:
-                pass
         if "video_bitrate" in cfg:
             self.bitrate_edit.setText(cfg["video_bitrate"])
         if "bufsize" in cfg:
