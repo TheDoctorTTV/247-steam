@@ -307,7 +307,8 @@ class StreamWorker(QtCore.QObject):
                 )
             elif self.cfg.fontfile:
                 self.log.emit(f"[WARN] Font file not found: {font_path}")
-        vf.append(f"format={self.cfg.pix_fmt}")
+        vf.append(f"format={self.cfg.pix_fmt}")  # keep format as a separate filter
+        vf_chain = ",".join(vf)
 
         cmd = [
             self.ffmpeg_path or "ffmpeg",
@@ -329,7 +330,7 @@ class StreamWorker(QtCore.QObject):
             "-fflags", "+genpts",
             "-r", str(self.cfg.fps), "-g", str(gop), "-keyint_min", str(gop),
             "-b:v", self.cfg.video_bitrate, "-maxrate", self.cfg.video_bitrate, "-bufsize", self.cfg.bufsize,
-            "-vf", ",".join(vf),
+            "-vf", vf_chain,
             "-c:a", "aac", "-b:a", self.cfg.audio_bitrate, "-ar", "44100", "-ac", "2",
             "-f", "flv", self.cfg.rtmp_url()
         ]
@@ -371,11 +372,8 @@ class StreamWorker(QtCore.QObject):
         )
 
         def _reader(stream):
-            try:
-                for line in iter(stream.readline, ""):
-                    self.log.emit(line.rstrip())
-            finally:
-                stream.close()
+            for line in iter(stream.readline, ""):
+                self.log.emit(line.rstrip())
 
         readers = []
         if self.ff_proc.stdout:
@@ -408,6 +406,16 @@ class StreamWorker(QtCore.QObject):
 
         for t in readers:
             t.join(timeout=0.2)
+
+        # Ensure any buffered ffmpeg output is flushed after the process exits
+        if self.ff_proc:
+            for stream in (self.ff_proc.stdout, self.ff_proc.stderr):
+                if stream:
+                    leftover = stream.read()
+                    if leftover:
+                        for line in leftover.splitlines():
+                            self.log.emit(line.rstrip())
+                    stream.close()
 
 
     # ---------- main loop ----------
