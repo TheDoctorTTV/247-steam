@@ -524,7 +524,10 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} — YouTube 24/7 VOD Streamer")
-        self.setMinimumSize(860, 680)
+        # Allow the window to shrink when the console is hidden. Keep a sensible
+        # minimum width, but let the height adjust dynamically.
+        self.setMinimumWidth(860)
+        self.resize(860, 680)
         self.worker_thread: Optional[QtCore.QThread] = None
         self.worker: Optional[StreamWorker] = None
         self.streaming = False
@@ -618,7 +621,7 @@ class MainWindow(QtWidgets.QWidget):
         self.start_btn.clicked.connect(self.on_start)
         self.stop_btn.clicked.connect(self.on_stop)
         self.skip_btn.clicked.connect(self.on_skip)
-        self.console_chk.toggled.connect(self.console.setVisible)
+        self.console_chk.toggled.connect(self.on_console_toggle)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
         self.browse_btn.clicked.connect(self.on_browse_bumper)
         self.font_btn.clicked.connect(self.on_browse_font)
@@ -711,6 +714,13 @@ class MainWindow(QtWidgets.QWidget):
         if path:
             self.font_edit.setText(path)
             self.save_settings()
+
+    def on_console_toggle(self, checked: bool):
+        """Show or hide the log console without shifting the rest of the UI."""
+        self.console.setVisible(checked)
+        # Collapse the console area when hidden so the window height adjusts
+        self.console.setMaximumHeight(16777215 if checked else 0)
+        self.adjustSize()
 
     def on_quality_change(self):
         choice = self.res_combo.currentText()
