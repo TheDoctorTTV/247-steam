@@ -12,18 +12,22 @@ from typing import List, Optional, Tuple
 from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 
-APP_NAME = "Stream247"
-IS_WIN = (os.name == "nt")
-CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
-CREATE_NEW_PROCESS_GROUP = 0x00000200 if IS_WIN else 0
+# General application metadata and platform helpers
+APP_NAME = "Stream247"  # Name shown in the GUI and taskbar
+IS_WIN = (os.name == "nt")  # True when running on Windows
+CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0  # Hide console windows
+CREATE_NEW_PROCESS_GROUP = 0x00000200 if IS_WIN else 0  # Allow child process killing
 
+# Startup information for subprocesses (only meaningful on Windows)
 STARTUPINFO = None
 if IS_WIN:
     STARTUPINFO = subprocess.STARTUPINFO()
+    # Prevent ffmpeg/yt-dlp windows from flashing on screen
     STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # hide windows
 
 # ---------- config.json helpers ----------
 def _app_dir() -> Path:
+    """Return the directory where the app is running from."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys.executable).parent  # packaged exe folder
     return Path.cwd()                       # running from source
@@ -31,6 +35,7 @@ def _app_dir() -> Path:
 CONFIG_PATH = _app_dir() / "config.json"
 
 def load_config_json() -> dict:
+    """Load configuration settings from CONFIG_PATH if it exists."""
     try:
         if CONFIG_PATH.exists():
             return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -39,6 +44,7 @@ def load_config_json() -> dict:
     return {}
 
 def save_config_json(data: dict) -> None:
+    """Persist the configuration dictionary to CONFIG_PATH."""
     try:
         CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
@@ -46,6 +52,7 @@ def save_config_json(data: dict) -> None:
 
 # ---------- misc utilities ----------
 def resource_path(name: str) -> str:
+    """Resolve a resource path for frozen executables or source runs."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
     p = Path(base) / name
     if p.exists():
@@ -53,6 +60,7 @@ def resource_path(name: str) -> str:
     return str(Path.cwd() / name)
 
 def find_binary(candidates: List[str]) -> Optional[str]:
+    """Search PATH and local resources for the first existing executable."""
     for c in candidates:
         p = shutil.which(c)
         if p:
@@ -64,24 +72,29 @@ def find_binary(candidates: List[str]) -> Optional[str]:
     return None
 
 def find_ffmpeg() -> Optional[str]:
+    """Locate an ffmpeg binary in PATH or alongside the executable."""
     return find_binary(["ffmpeg", "ffmpeg.exe"])
 
 def find_ytdlp() -> Optional[str]:
+    """Locate a yt-dlp binary in PATH or alongside the executable."""
     return find_binary(["yt-dlp.exe", "yt-dlp"])
 
 def run_hidden(cmd: List[str], check=False, capture=True, text=True, timeout=None) -> subprocess.CompletedProcess:
+    """Run a subprocess without showing a console window."""
     kwargs = dict(startupinfo=STARTUPINFO, creationflags=CREATE_NO_WINDOW)
     if capture:
         kwargs.update(dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text))
     return subprocess.run(cmd, check=check, timeout=timeout, **kwargs)
 
 def safe_write_text(path: Path, text: str) -> None:
+    """Write text to a file, ignoring any errors that occur."""
     try:
         path.write_text(text, encoding="utf-8", errors="ignore")
     except Exception:
         pass
 
 def ffprobe_encoder(ffmpeg_path: str, codec: str) -> bool:
+    """Check whether ``ffmpeg`` can use a specific encoder."""
     try:
         null = "NUL" if IS_WIN else "/dev/null"
         cmd = [
@@ -94,6 +107,7 @@ def ffprobe_encoder(ffmpeg_path: str, codec: str) -> bool:
         return False
 
 def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts: Optional[int]) -> Optional[str]:
+    """Return a human‑friendly YouTube upload date."""
     dt = None
     if upload_date and len(upload_date) == 8 and upload_date.isdigit():
         try:
@@ -115,6 +129,8 @@ def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts
 # ---------- streaming core ----------
 @dataclass
 class StreamConfig:
+    """Configuration options for the livestream."""
+
     playlist_url: str
     stream_key: str
     rtmp_base: str = "rtmp://a.rtmp.youtube.com/live2"
@@ -135,9 +151,13 @@ class StreamConfig:
     extra_venc_flags: List[str] = None  # type: ignore
 
     def rtmp_url(self) -> str:
+        """Construct the full RTMP URL using the base and stream key."""
         return f"{self.rtmp_base}/{self.stream_key}"
 
+
 class StreamWorker(QtCore.QObject):
+    """Background worker that handles playlist streaming with ffmpeg."""
+
     log = QtCore.Signal(str)
     status = QtCore.Signal(str)
     finished = QtCore.Signal()
@@ -145,6 +165,7 @@ class StreamWorker(QtCore.QObject):
     ff_proc: Optional[subprocess.Popen]
 
     def __init__(self, cfg: StreamConfig, parent=None):
+        """Store configuration and initialise worker state."""
         super().__init__(parent)
         self.cfg = cfg
         self._stop = threading.Event()
@@ -155,6 +176,7 @@ class StreamWorker(QtCore.QObject):
 
     # ---------- control ----------
     def stop(self):
+        """Request the current ffmpeg process to terminate."""
         self._stop.set()
         self.log.emit("[INFO] Stop requested — killing ffmpeg…")
         try:
@@ -185,6 +207,7 @@ class StreamWorker(QtCore.QObject):
             self.ff_proc = None
 
     def skip(self):
+        """Abort the current video and advance to the next."""
         self._skip.set()
         self.log.emit("[INFO] Skip requested — advancing to next item…")
         try:
@@ -195,6 +218,7 @@ class StreamWorker(QtCore.QObject):
 
     # ---------- yt-dlp helpers ----------
     def get_video_ids(self, playlist_url: str) -> List[str]:
+        """Return a list of video IDs contained in a YouTube playlist."""
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found. Put it next to the EXE or in PATH.")
         cmd = [self.ytdlp_path, "--ignore-errors", "--flat-playlist", "--get-id", playlist_url]
@@ -204,6 +228,7 @@ class StreamWorker(QtCore.QObject):
         return [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
 
     def get_metadata(self, video_id: str) -> Tuple[str, Optional[str]]:
+        """Fetch the title and upload date for a video."""
         if not self.ytdlp_path:
             return self.get_title_legacy(video_id), None
         url = f"https://www.youtube.com/watch?v={video_id}"
@@ -219,6 +244,7 @@ class StreamWorker(QtCore.QObject):
         return title, pretty_date
 
     def get_title_legacy(self, video_id: str) -> str:
+        """Fallback title retrieval using yt-dlp's --get-title."""
         url = f"https://www.youtube.com/watch?v={video_id}"
         if not self.ytdlp_path:
             return url
@@ -226,6 +252,7 @@ class StreamWorker(QtCore.QObject):
         return (cp.stdout or "").strip() if cp.returncode == 0 and cp.stdout else url
 
     def get_stream_urls(self, video_id: str) -> Tuple[str, Optional[str]]:
+        """Return direct media URLs for a video (video and optional audio)."""
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found.")
         url = f"https://www.youtube.com/watch?v={video_id}"
@@ -240,6 +267,7 @@ class StreamWorker(QtCore.QObject):
 
     # ---------- encoder selection ----------
     def select_encoder(self):
+        """Choose the best available hardware encoder."""
         self.cfg.encoder = "libx264"
         self.cfg.encoder_name = "CPU x264"
         self.cfg.pix_fmt = "yuv420p"
@@ -252,7 +280,7 @@ class StreamWorker(QtCore.QObject):
             self.cfg.pix_fmt = "yuv420p"
             self.cfg.extra_venc_flags = [
                 "-preset", "p4", "-rc", "cbr_hq", "-tune", "hq",
-                "-spatial_aq", "1", "-temporal_aq", "1", "-aq-strength", "8"
+                "-spatial_aq", "1", "-temporal_aq", "1", "-aq-strength", "8",
             ]
             return
         if ffprobe_encoder(self.ffmpeg_path, "h264_qsv"):
@@ -270,6 +298,7 @@ class StreamWorker(QtCore.QObject):
 
     # ---------- ffmpeg ----------
     def build_ffmpeg_cmd(self, vurl: str, aurl: Optional[str]) -> List[str]:
+        """Build the ffmpeg command for a single video stream."""
         gop = self.cfg.fps * 2
         vf = [f"scale=-2:{self.cfg.height}:flags=bicubic"]
         if self.cfg.overlay_titles:
@@ -309,6 +338,7 @@ class StreamWorker(QtCore.QObject):
         return cmd
 
     def run_one_video(self, video_id: str):
+        """Stream a single video using ffmpeg."""
         # Title + date overlay (truncate title; keep date intact)
         title, pretty_date = self.get_metadata(video_id)
         if self.cfg.overlay_titles:
@@ -359,6 +389,7 @@ class StreamWorker(QtCore.QObject):
             t.start()
             readers.append(t)
 
+        # Wait until ffmpeg finishes or a stop/skip is requested
         while self.ff_proc and self.ff_proc.poll() is None and not (
             self._stop.is_set() or self._skip.is_set()
         ):
@@ -393,6 +424,7 @@ class StreamWorker(QtCore.QObject):
     # ---------- main loop ----------
     @QtCore.Slot()
     def run(self):
+        """Main worker loop that continually streams the playlist."""
         if not self.ffmpeg_path:
             self.log.emit("[ERROR] ffmpeg not found. Put ffmpeg.exe next to the EXE or in PATH.")
             self.finished.emit()
@@ -407,7 +439,9 @@ class StreamWorker(QtCore.QObject):
         self.log.emit(f"[INFO] Encoder: {self.cfg.encoder_name} ({self.cfg.encoder})")
         self.log.emit(f"[INFO] Playlist: {self.cfg.playlist_url}")
         self.log.emit(f"[INFO] RTMP:     {self.cfg.rtmp_url()}")
-        self.log.emit(f"[INFO] Output:   {self.cfg.height}p@{self.cfg.fps}  ~{self.cfg.video_bitrate} video + {self.cfg.audio_bitrate} audio\n")
+        self.log.emit(
+            f"[INFO] Output:   {self.cfg.height}p@{self.cfg.fps}  ~{self.cfg.video_bitrate} video + {self.cfg.audio_bitrate} audio\n"
+        )
 
         while not self._stop.is_set():
             try:
@@ -438,7 +472,6 @@ class StreamWorker(QtCore.QObject):
 
                     if self._stop.is_set():
                         break
-
 
                 if self._stop.is_set():
                     break
@@ -480,10 +513,13 @@ QCheckBox::indicator:unchecked {
 """
 
 class MainWindow(QtWidgets.QWidget):
+    """Main application window housing the GUI and controls."""
+
     startRequested = QtCore.Signal(StreamConfig)
     stopRequested = QtCore.Signal()
 
     def __init__(self):
+        """Initialise all widgets and connect signals."""
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} — YouTube 24/7 VOD Streamer")
         # Allow the window to shrink when the console is hidden. Keep a sensible
@@ -591,6 +627,7 @@ class MainWindow(QtWidgets.QWidget):
 
     # --- settings (config.json) ---
     def load_settings(self):
+        """Restore persisted settings from ``config.json``."""
         cfg = load_config_json()
         remember = str(cfg.get("remember", True)).lower() in ("1", "true", "yes", "on")
         self.remember_chk.setChecked(remember)
@@ -613,6 +650,7 @@ class MainWindow(QtWidgets.QWidget):
             self.bufsize_edit.setText(cfg["bufsize"])
 
     def save_settings(self):
+        """Persist user settings to ``config.json``."""
         data = load_config_json()
         data.update({
             "remember": self.remember_chk.isChecked(),
@@ -632,11 +670,13 @@ class MainWindow(QtWidgets.QWidget):
         save_config_json(data)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Persist settings when the window is closed."""
         self.save_settings()
         return super().closeEvent(event)
 
     # --- UI helpers ---
     def append_log(self, text: str):
+        """Append text to the on-screen console and optional log file."""
         self.console.append(text)
         self.console.moveCursor(QtGui.QTextCursor.End)
         if self.log_fh:
@@ -654,6 +694,7 @@ class MainWindow(QtWidgets.QWidget):
         self.adjustSize()
 
     def on_quality_change(self):
+        """Update internal FPS/height presets when the quality dropdown changes."""
         choice = self.res_combo.currentText()
         if "480p30" in choice:
             self._fps = 30; self._height = 480
@@ -681,6 +722,7 @@ class MainWindow(QtWidgets.QWidget):
                 self.bitrate_edit.setText("6000k"); self.bufsize_edit.setText("12000k")
 
     def make_config(self) -> StreamConfig:
+        """Create a StreamConfig from the current UI state."""
         return StreamConfig(
             playlist_url=self.playlist_edit.text().strip(),
             stream_key=self.key_edit.text().strip(),
@@ -697,6 +739,7 @@ class MainWindow(QtWidgets.QWidget):
 
     # --- start/stop wiring ---
     def on_start(self):
+        """Validate input and start the background streaming worker."""
         if self.streaming:
             return
         cfg = self.make_config()
@@ -744,6 +787,7 @@ class MainWindow(QtWidgets.QWidget):
         self.worker_thread.start()
 
     def on_stop(self):
+        """Stop the streaming worker gracefully."""
         if not self.streaming:
             return
         self.append_log("[INFO] Stopping…")
@@ -763,6 +807,7 @@ class MainWindow(QtWidgets.QWidget):
         self.skip_btn.setEnabled(False)
 
     def on_skip(self):
+        """Skip the current video."""
         if not self.streaming or not self.worker:
             return
         self.append_log("[INFO] Skipping…")
@@ -772,6 +817,7 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
     def on_finished(self):
+        """Cleanup once the worker thread stops."""
         self.append_log("[INFO] Worker finished.")
         if self.log_fh:
             try:
@@ -794,6 +840,7 @@ class MainWindow(QtWidgets.QWidget):
 
 # ---------- entry ----------
 def main():
+    """Entry point to launch the Qt application."""
     # Ensure taskbar groups under our app and can show our icon (Windows)
     if IS_WIN:
         import ctypes
