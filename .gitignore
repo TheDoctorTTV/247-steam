@@ -179,7 +179,11 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# generic text files
 *.txt
+
+# keep dependency file
+!requirements.txt
 *.json
 ffmpeg.exe
 yt-dlp.exe

@@ -11,6 +11,12 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
+from qfluentwidgets import (
+    FluentWindow, TabView, setTheme, Theme, FluentIcon,
+    LineEdit, ComboBox, PushButton, TextEdit, SpinBox, SwitchButton,
+    InfoBar, InfoBarPosition
+)
+from version import __version__
 
 # General application metadata and platform helpers
 APP_NAME = "Stream247"  # Name shown in the GUI and taskbar
@@ -488,31 +494,9 @@ class StreamWorker(QtCore.QObject):
         self.finished.emit()
 
 # ---------- GUI (dark & readable checkboxes) ----------
-DARK_QSS = """
-* { color: #e6e6e6; font-family: Segoe UI, Arial, sans-serif; }
-QWidget { background: #111315; }
-QLineEdit, QComboBox, QTextEdit, QSpinBox {
-  background: #1a1d21; border: 1px solid #2a2f36; border-radius: 8px; padding: 6px;
-}
-QPushButton { background: #2b6cb0; border: none; border-radius: 10px; padding: 8px 12px; font-weight: 600; }
-QPushButton:hover { background: #2f76c2; }
-QPushButton:disabled { background: #2a2f36; color: #8a8f98; }
-QGroupBox { border: 1px solid #2a2f36; border-radius: 10px; margin-top: 12px; }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
 
-QCheckBox::indicator {
-  width: 18px; height: 18px; border: 1px solid #2a2f36; border-radius: 4px;
-  background: #1a1d21;
-}
-QCheckBox::indicator:checked {
-  background: #2b6cb0; border: 1px solid #2b6cb0; image: none;
-}
-QCheckBox::indicator:unchecked {
-  background: #1a1d21; image: none;
-}
-"""
 
-class MainWindow(QtWidgets.QWidget):
+class MainWindow(FluentWindow):
     """Main application window housing the GUI and controls."""
 
     startRequested = QtCore.Signal(StreamConfig)
@@ -522,108 +506,170 @@ class MainWindow(QtWidgets.QWidget):
         """Initialise all widgets and connect signals."""
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} — YouTube 24/7 VOD Streamer")
-        # Allow the window to shrink when the console is hidden. Keep a sensible
-        # minimum width, but let the height adjust dynamically.
-        self.setMinimumWidth(860)
-        self.resize(860, 680)
+        self.resize(980, 700)
+
+        # try enabling Mica effect (ignored on unsupported systems)
+        try:
+            self.setMicaEffectEnabled(True)
+        except Exception:
+            pass
+
+        # hide side navigation and use full window for content
+        try:
+            self.navigationInterface.setHidden(True)
+            self.widgetLayout.setContentsMargins(0, 0, 0, 0)
+        except Exception:
+            pass
+
         self.worker_thread: Optional[QtCore.QThread] = None
         self.worker: Optional[StreamWorker] = None
         self.streaming = False
         self.log_fh = None
 
-        # Inputs
-        self.playlist_edit = QtWidgets.QLineEdit("")
+        # Tab view container
+        self.tabs = TabView(self)
+        self.stackedWidget.addWidget(self.tabs)
+        self.stackedWidget.setCurrentWidget(self.tabs)
+
+        # ---------- Stream tab ----------
+        self.stream_page = QtWidgets.QWidget()
+        stream_layout = QtWidgets.QVBoxLayout(self.stream_page)
+
+        form = QtWidgets.QGridLayout()
+        self.playlist_edit = LineEdit("")
         self.playlist_edit.setPlaceholderText("Your YouTube playlist URL…")
-        self.key_edit = QtWidgets.QLineEdit("")
+        self.key_edit = LineEdit("")
         self.key_edit.setPlaceholderText("Your YouTube stream key…")
         self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
 
-        self.res_combo = QtWidgets.QComboBox()
+        self.res_combo = ComboBox()
         self.res_combo.addItems(["480p30", "480p60", "720p30", "720p60", "1080p30", "1080p60"])
         self.res_combo.setCurrentText("720p30")
-        self.bitrate_edit = QtWidgets.QLineEdit("2300k")
-        self.bufsize_edit = QtWidgets.QLineEdit("4600k")
+        self.bitrate_edit = LineEdit("2300k")
+        self.bufsize_edit = LineEdit("4600k")
 
-        self.overlay_chk = QtWidgets.QCheckBox("Overlay current VOD title")
-        self.overlay_chk.setChecked(True)
-        self.shuffle_chk = QtWidgets.QCheckBox("Shuffle playlist order")
-        self.logfile_chk = QtWidgets.QCheckBox("Log to file")
-        self.console_chk = QtWidgets.QCheckBox("Show console")
-        self.console_chk.setChecked(True)
-        self.remember_chk = QtWidgets.QCheckBox("Save playlist and key")
-        self.remember_chk.setChecked(True)
-
-        self.console = QtWidgets.QTextEdit()
-        self.console.setReadOnly(True)
-        self.console.setVisible(True)
-
-        self.start_btn = QtWidgets.QPushButton("Start Stream")
-        self.stop_btn = QtWidgets.QPushButton("Stop Stream")
-        self.stop_btn.setEnabled(False)
-        self.skip_btn = QtWidgets.QPushButton("Skip Video")
-        self.skip_btn.setEnabled(False)
-
-        # Layout
-        form = QtWidgets.QGridLayout()
         form.addWidget(QtWidgets.QLabel("Playlist URL"), 0, 0)
         form.addWidget(self.playlist_edit, 0, 1, 1, 3)
         form.addWidget(QtWidgets.QLabel("Stream Key"), 1, 0)
         form.addWidget(self.key_edit, 1, 1, 1, 3)
-
         form.addWidget(QtWidgets.QLabel("Quality"), 2, 0)
         form.addWidget(self.res_combo, 2, 1)
         form.addWidget(QtWidgets.QLabel("Video Bitrate"), 2, 2)
         form.addWidget(self.bitrate_edit, 2, 3)
-
         form.addWidget(QtWidgets.QLabel("Buffer Size"), 3, 2)
         form.addWidget(self.bufsize_edit, 3, 3)
 
         toggles = QtWidgets.QHBoxLayout()
+        self.overlay_chk = SwitchButton("Overlay current VOD title")
+        self.overlay_chk.setChecked(True)
+        self.shuffle_chk = SwitchButton("Shuffle playlist order")
         toggles.addWidget(self.overlay_chk)
         toggles.addWidget(self.shuffle_chk)
-        toggles.addWidget(self.logfile_chk)
         toggles.addStretch(1)
-        toggles.addWidget(self.console_chk)
-
-        bottom_opts = QtWidgets.QHBoxLayout()
-        bottom_opts.addWidget(self.remember_chk)
-        bottom_opts.addStretch(1)
 
         btns = QtWidgets.QHBoxLayout()
+        self.start_btn = PushButton("Start Stream", icon=FluentIcon.PLAY)
+        self.stop_btn = PushButton("Stop Stream", icon=FluentIcon.STOP)
+        self.stop_btn.setEnabled(False)
+        self.skip_btn = PushButton("Skip Video", icon=FluentIcon.FORWARD)
+        self.skip_btn.setEnabled(False)
         btns.addWidget(self.start_btn)
         btns.addWidget(self.stop_btn)
         btns.addWidget(self.skip_btn)
         btns.addStretch(1)
 
-        v = QtWidgets.QVBoxLayout(self)
-        header = QtWidgets.QLabel("Loop your public YouTube VOD playlist to YouTube Live 24/7. Auto-encoder picks NVENC/QSV/AMF/x264.")
+        header = QtWidgets.QLabel(
+            "Loop your public YouTube VOD playlist to YouTube Live 24/7. Auto-encoder picks NVENC/QSV/AMF/x264.")
         header.setWordWrap(True)
-        header.setStyleSheet("font-size:14px; color:#b9c2cf;")
-        v.addWidget(header)
-        v.addLayout(form)
-        v.addLayout(toggles)
-        v.addLayout(bottom_opts)
-        v.addLayout(btns)
-        v.addWidget(self.console, 1)
+        stream_layout.addWidget(header)
+        stream_layout.addLayout(form)
+        stream_layout.addLayout(toggles)
+        stream_layout.addLayout(btns)
+        stream_layout.addStretch(1)
 
-        # Signals
+        self.tabs.addTab(self.stream_page, FluentIcon.PLAY, "Stream")
+
+        # ---------- Settings tab ----------
+        self.settings_page = QtWidgets.QWidget()
+        settings_layout = QtWidgets.QVBoxLayout(self.settings_page)
+
+        self.remember_chk = SwitchButton("Save playlist and key")
+        self.remember_chk.setChecked(True)
+        self.logfile_chk = SwitchButton("Log to file")
+        self.console_chk = SwitchButton("Show console")
+        self.console_chk.setChecked(True)
+        self.theme_combo = ComboBox()
+        self.theme_combo.addItems(["System", "Light", "Dark"])
+
+        settings_layout.addWidget(self.remember_chk)
+        settings_layout.addWidget(self.logfile_chk)
+        settings_layout.addWidget(self.console_chk)
+
+        theme_row = QtWidgets.QHBoxLayout()
+        theme_row.addWidget(QtWidgets.QLabel("Theme"))
+        theme_row.addWidget(self.theme_combo)
+        theme_row.addStretch(1)
+        settings_layout.addLayout(theme_row)
+        settings_layout.addStretch(1)
+
+        self.tabs.addTab(self.settings_page, FluentIcon.SETTING, "Settings")
+
+        # ---------- Logs tab ----------
+        self.logs_page = QtWidgets.QWidget()
+        logs_layout = QtWidgets.QVBoxLayout(self.logs_page)
+        self.console = TextEdit()
+        self.console.setReadOnly(True)
+        logs_layout.addWidget(self.console)
+        self.tabs.addTab(self.logs_page, FluentIcon.DOCUMENT, "Logs")
+
+        # ---------- About tab ----------
+        self.about_page = QtWidgets.QWidget()
+        about_layout = QtWidgets.QVBoxLayout(self.about_page)
+        logo = QtWidgets.QLabel()
+        pix = QtGui.QPixmap(resource_path("icon.ico"))
+        if not pix.isNull():
+            logo.setPixmap(pix.scaled(64, 64, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+            logo.setAlignment(QtCore.Qt.AlignCenter)
+            about_layout.addWidget(logo)
+        title = QtWidgets.QLabel("Stream247 — YouTube 24/7 VOD Streamer")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        font = title.font(); font.setPointSize(16); title.setFont(font)
+        about_layout.addWidget(title)
+        ver = QtWidgets.QLabel(f"Version: {__version__}")
+        ver.setAlignment(QtCore.Qt.AlignCenter)
+        about_layout.addWidget(ver)
+        author = QtWidgets.QLabel("Author: TheDoctorTTV")
+        author.setAlignment(QtCore.Qt.AlignCenter)
+        about_layout.addWidget(author)
+        links = QtWidgets.QLabel(
+            '<a href="https://github.com/">GitHub</a> | <a href="https://thedoctorttv.com">Website</a>')
+        links.setAlignment(QtCore.Qt.AlignCenter)
+        links.setOpenExternalLinks(True)
+        about_layout.addWidget(links)
+        about_layout.addStretch(1)
+        self.tabs.addTab(self.about_page, FluentIcon.INFO, "About")
+
+        # signals
         self.start_btn.clicked.connect(self.on_start)
         self.stop_btn.clicked.connect(self.on_stop)
         self.skip_btn.clicked.connect(self.on_skip)
         self.console_chk.toggled.connect(self.on_console_toggle)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
+        self.theme_combo.currentIndexChanged.connect(self.on_theme_change)
 
         # persist as you tweak
         self.remember_chk.toggled.connect(lambda _: self.save_settings())
         self.overlay_chk.toggled.connect(lambda _: self.save_settings())
         self.shuffle_chk.toggled.connect(lambda _: self.save_settings())
         self.logfile_chk.toggled.connect(lambda _: self.save_settings())
+        self.console_chk.toggled.connect(lambda _: self.save_settings())
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
 
         self.on_quality_change()
         self.load_settings()
+        self.on_console_toggle(self.console_chk.isChecked())
 
     # --- settings (config.json) ---
     def load_settings(self):
@@ -639,6 +685,7 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay_chk.setChecked(bool(cfg.get("overlay_titles", True)))
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
         self.logfile_chk.setChecked(bool(cfg.get("log_to_file", False)))
+        self.console_chk.setChecked(bool(cfg.get("show_console", True)))
 
         if "quality" in cfg:
             idx = self.res_combo.findText(cfg["quality"])
@@ -657,6 +704,7 @@ class MainWindow(QtWidgets.QWidget):
             "overlay_titles": self.overlay_chk.isChecked(),
             "shuffle": self.shuffle_chk.isChecked(),
             "log_to_file": self.logfile_chk.isChecked(),
+            "show_console": self.console_chk.isChecked(),
             "quality": self.res_combo.currentText(),
             "video_bitrate": self.bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
@@ -689,9 +737,6 @@ class MainWindow(QtWidgets.QWidget):
     def on_console_toggle(self, checked: bool):
         """Show or hide the log console without shifting the rest of the UI."""
         self.console.setVisible(checked)
-        # Collapse the console area when hidden so the window height adjusts
-        self.console.setMaximumHeight(16777215 if checked else 0)
-        self.adjustSize()
 
     def on_quality_change(self):
         """Update internal FPS/height presets when the quality dropdown changes."""
@@ -721,6 +766,20 @@ class MainWindow(QtWidgets.QWidget):
             if not self.streaming:
                 self.bitrate_edit.setText("6000k"); self.bufsize_edit.setText("12000k")
 
+    def on_theme_change(self):
+        """Switch between light/dark/system themes."""
+        choice = self.theme_combo.currentText().lower()
+        if choice == "light":
+            setTheme(Theme.LIGHT)
+        elif choice == "dark":
+            setTheme(Theme.DARK)
+        else:
+            setTheme(Theme.AUTO)
+
+    def appendLog(self, text: str):
+        """CamelCase helper for logging."""
+        self.append_log(text)
+
     def make_config(self) -> StreamConfig:
         """Create a StreamConfig from the current UI state."""
         return StreamConfig(
@@ -744,7 +803,14 @@ class MainWindow(QtWidgets.QWidget):
             return
         cfg = self.make_config()
         if not cfg.playlist_url or not cfg.stream_key:
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "Please enter Playlist URL and Stream Key.")
+            InfoBar.warning(
+                title=APP_NAME,
+                content="Please enter Playlist URL and Stream Key.",
+                orient=QtCore.Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                parent=self
+            )
             return
 
         # save settings right when starting (if 'remember' is checked)
@@ -853,7 +919,7 @@ def main():
     icon = QtGui.QIcon(resource_path("icon.ico"))
     app.setWindowIcon(icon)  # taskbar/dock icon
 
-    app.setStyleSheet(DARK_QSS)
+    setTheme(Theme.AUTO)
     w = MainWindow()
     w.setWindowIcon(icon)    # title-bar icon
     w.resize(980, 700)
