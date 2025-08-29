@@ -128,6 +128,7 @@ class StreamConfig:
     fontfile: str = r"C:\Windows\Fonts\arial.ttf"
     title_file: str = "current_title.txt"
     bumper_path: str = ""
+    codec: str = "h264"
 
     # runtime-selected
     encoder: str = "libx264"
@@ -241,33 +242,94 @@ class StreamWorker(QtCore.QObject):
 
     # ---------- encoder selection ----------
     def select_encoder(self):
-        self.cfg.encoder = "libx264"
-        self.cfg.encoder_name = "CPU x264"
-        self.cfg.pix_fmt = "yuv420p"
-        self.cfg.extra_venc_flags = ["-preset", "veryfast"]
-        if not self.ffmpeg_path:
-            return
-        if ffprobe_encoder(self.ffmpeg_path, "h264_nvenc"):
-            self.cfg.encoder = "h264_nvenc"
-            self.cfg.encoder_name = "NVIDIA NVENC"
+        codec = getattr(self.cfg, "codec", "h264")
+
+        if codec == "hevc":
+            self.cfg.encoder = "libx265"
+            self.cfg.encoder_name = "CPU x265"
             self.cfg.pix_fmt = "yuv420p"
-            self.cfg.extra_venc_flags = [
-                "-preset", "p4", "-rc", "cbr_hq", "-tune", "hq",
-                "-spatial_aq", "1", "-temporal_aq", "1", "-aq-strength", "8"
-            ]
-            return
-        if ffprobe_encoder(self.ffmpeg_path, "h264_qsv"):
-            self.cfg.encoder = "h264_qsv"
-            self.cfg.encoder_name = "Intel Quick Sync"
-            self.cfg.pix_fmt = "nv12"
-            self.cfg.extra_venc_flags = ["-look_ahead", "1"]
-            return
-        if ffprobe_encoder(self.ffmpeg_path, "h264_amf"):
-            self.cfg.encoder = "h264_amf"
-            self.cfg.encoder_name = "AMD AMF"
+            self.cfg.extra_venc_flags = ["-preset", "veryfast"]
+            if not self.ffmpeg_path:
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "hevc_nvenc"):
+                self.cfg.encoder = "hevc_nvenc"
+                self.cfg.encoder_name = "NVIDIA HEVC"
+                self.cfg.pix_fmt = "yuv420p"
+                self.cfg.extra_venc_flags = [
+                    "-preset", "p4", "-rc", "cbr_hq", "-tune", "hq",
+                    "-spatial_aq", "1", "-temporal_aq", "1", "-aq-strength", "8"
+                ]
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "hevc_qsv"):
+                self.cfg.encoder = "hevc_qsv"
+                self.cfg.encoder_name = "Intel HEVC"
+                self.cfg.pix_fmt = "nv12"
+                self.cfg.extra_venc_flags = ["-look_ahead", "1"]
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "hevc_amf"):
+                self.cfg.encoder = "hevc_amf"
+                self.cfg.encoder_name = "AMD HEVC"
+                self.cfg.pix_fmt = "yuv420p"
+                self.cfg.extra_venc_flags = ["-rc", "cbr", "-quality", "quality", "-usage", "transcoding"]
+                return
+
+        elif codec == "av1":
+            self.cfg.encoder = "libsvtav1"
+            self.cfg.encoder_name = "CPU AV1"
             self.cfg.pix_fmt = "yuv420p"
-            self.cfg.extra_venc_flags = ["-rc", "cbr", "-quality", "quality", "-usage", "transcoding"]
-            return
+            self.cfg.extra_venc_flags = ["-preset", "7"]
+            if not self.ffmpeg_path:
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "av1_nvenc"):
+                self.cfg.encoder = "av1_nvenc"
+                self.cfg.encoder_name = "NVIDIA AV1"
+                self.cfg.pix_fmt = "yuv420p"
+                self.cfg.extra_venc_flags = [
+                    "-preset", "p4", "-rc", "cbr_hq", "-tune", "hq",
+                    "-spatial_aq", "1", "-temporal_aq", "1", "-aq-strength", "8"
+                ]
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "av1_qsv"):
+                self.cfg.encoder = "av1_qsv"
+                self.cfg.encoder_name = "Intel AV1"
+                self.cfg.pix_fmt = "yuv420p"
+                self.cfg.extra_venc_flags = ["-look_ahead", "1"]
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "av1_amf"):
+                self.cfg.encoder = "av1_amf"
+                self.cfg.encoder_name = "AMD AV1"
+                self.cfg.pix_fmt = "yuv420p"
+                self.cfg.extra_venc_flags = ["-rc", "cbr", "-usage", "transcoding"]
+                return
+
+        else:  # h264
+            self.cfg.encoder = "libx264"
+            self.cfg.encoder_name = "CPU x264"
+            self.cfg.pix_fmt = "yuv420p"
+            self.cfg.extra_venc_flags = ["-preset", "veryfast"]
+            if not self.ffmpeg_path:
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "h264_nvenc"):
+                self.cfg.encoder = "h264_nvenc"
+                self.cfg.encoder_name = "NVIDIA NVENC"
+                self.cfg.pix_fmt = "yuv420p"
+                self.cfg.extra_venc_flags = [
+                    "-preset", "p4", "-rc", "cbr_hq", "-tune", "hq",
+                    "-spatial_aq", "1", "-temporal_aq", "1", "-aq-strength", "8"
+                ]
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "h264_qsv"):
+                self.cfg.encoder = "h264_qsv"
+                self.cfg.encoder_name = "Intel Quick Sync"
+                self.cfg.pix_fmt = "nv12"
+                self.cfg.extra_venc_flags = ["-look_ahead", "1"]
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "h264_amf"):
+                self.cfg.encoder = "h264_amf"
+                self.cfg.encoder_name = "AMD AMF"
+                self.cfg.pix_fmt = "yuv420p"
+                self.cfg.extra_venc_flags = ["-rc", "cbr", "-quality", "quality", "-usage", "transcoding"]
+                return
 
     # ---------- ffmpeg ----------
     def build_ffmpeg_cmd(self, vurl: str, aurl: Optional[str]) -> List[str]:
@@ -299,6 +361,7 @@ class StreamWorker(QtCore.QObject):
         cmd += [
             *maps,
             "-c:v", self.cfg.encoder, *self.cfg.extra_venc_flags,
+            "-pix_fmt", self.cfg.pix_fmt,
             "-fflags", "+genpts",
             "-r", str(self.cfg.fps), "-g", str(gop), "-keyint_min", str(gop),
             "-b:v", self.cfg.video_bitrate, "-maxrate", self.cfg.video_bitrate, "-bufsize", self.cfg.bufsize,
@@ -511,6 +574,9 @@ class MainWindow(QtWidgets.QWidget):
         self.res_combo = QtWidgets.QComboBox()
         self.res_combo.addItems(["480p30", "480p60", "720p30", "720p60", "1080p30", "1080p60"])
         self.res_combo.setCurrentText("720p30")
+        self.codec_combo = QtWidgets.QComboBox()
+        self.codec_combo.addItems(["H.264", "HEVC", "AV1"])
+        self.codec_combo.setCurrentText("H.264")
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
         self.bumper_edit = QtWidgets.QLineEdit("")
@@ -546,6 +612,8 @@ class MainWindow(QtWidgets.QWidget):
         form.addWidget(QtWidgets.QLabel("Video Bitrate"), 2, 2)
         form.addWidget(self.bitrate_edit, 2, 3)
 
+        form.addWidget(QtWidgets.QLabel("Codec"), 3, 0)
+        form.addWidget(self.codec_combo, 3, 1)
         form.addWidget(QtWidgets.QLabel("Buffer Size"), 3, 2)
         form.addWidget(self.bufsize_edit, 3, 3)
 
@@ -593,6 +661,7 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay_chk.toggled.connect(lambda _: self.save_settings())
         self.shuffle_chk.toggled.connect(lambda _: self.save_settings())
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
+        self.codec_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
         self.bumper_edit.textChanged.connect(lambda _: self.save_settings())
@@ -613,6 +682,11 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay_chk.setChecked(bool(cfg.get("overlay_titles", True)))
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
 
+        if "codec" in cfg:
+            idx = self.codec_combo.findText(cfg["codec"])
+            if idx >= 0:
+                self.codec_combo.setCurrentIndex(idx)
+
         if "quality" in cfg:
             idx = self.res_combo.findText(cfg["quality"])
             if idx >= 0:
@@ -630,6 +704,7 @@ class MainWindow(QtWidgets.QWidget):
             "remember": self.remember_chk.isChecked(),
             "overlay_titles": self.overlay_chk.isChecked(),
             "shuffle": self.shuffle_chk.isChecked(),
+            "codec": self.codec_combo.currentText(),
             "quality": self.res_combo.currentText(),
             "video_bitrate": self.bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
@@ -691,6 +766,7 @@ class MainWindow(QtWidgets.QWidget):
                 self.bitrate_edit.setText("6000k"); self.bufsize_edit.setText("12000k")
 
     def make_config(self) -> StreamConfig:
+        codec_map = {"H.264": "h264", "HEVC": "hevc", "AV1": "av1"}
         return StreamConfig(
             playlist_url=self.playlist_edit.text().strip(),
             stream_key=self.key_edit.text().strip(),
@@ -705,6 +781,7 @@ class MainWindow(QtWidgets.QWidget):
             fontfile=r"C:\Windows\Fonts\arial.ttf",
             title_file="current_title.txt",
             bumper_path=self.bumper_edit.text().strip(),
+            codec=codec_map.get(self.codec_combo.currentText(), "h264"),
         )
 
     # --- start/stop wiring ---
