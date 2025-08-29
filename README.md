@@ -12,7 +12,7 @@ Stream247 automatically encodes your videos using available hardware acceleratio
   * Overlay current VOD title
   * Shuffle playlist order
   * Save playlist & key to config file
-* Test the playlist locally with your preferred video player
+* Test the playlist locally using your system's video player (Windows will prompt to choose an app)
 
 ## Usage
 
