@@ -281,8 +281,11 @@ class StreamWorker(QtCore.QObject):
         if ffprobe_encoder(self.ffmpeg_path, "h264_qsv"):
             self.cfg.encoder = "h264_qsv"
             self.cfg.encoder_name = "Intel Quick Sync"
-            self.cfg.pix_fmt = "nv12"
-            self.cfg.extra_venc_flags = ["-look_ahead", "1"]
+            # Quick Sync works internally with NV12 but YouTube expects yuv420p;
+            # using yuv420p here ensures compatibility and avoids encoding
+            # errors on systems where "look_ahead" isn't supported.
+            self.cfg.pix_fmt = "yuv420p"
+            self.cfg.extra_venc_flags = ["-preset", "veryfast"]
             return
         if ffprobe_encoder(self.ffmpeg_path, "h264_amf"):
             self.cfg.encoder = "h264_amf"
