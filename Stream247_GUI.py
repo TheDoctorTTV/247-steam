@@ -12,11 +12,42 @@ from typing import List, Optional, Tuple
 from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 from qfluentwidgets import (
-    FluentWindow, TabView, setTheme, Theme, FluentIcon,
+    FluentWindow, setTheme, Theme, FluentIcon, Pivot,
     LineEdit, ComboBox, PushButton, TextEdit, SpinBox, SwitchButton,
     InfoBar, InfoBarPosition
 )
 from version import __version__
+
+
+class TabView(QtWidgets.QWidget):
+    """Lightweight tab container built with ``Pivot`` for PySide6."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pivot = Pivot(self)
+        self._stack = QtWidgets.QStackedWidget(self)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._pivot)
+        layout.addWidget(self._stack)
+
+        self._routes: list[str] = []
+        self._pivot.currentItemChanged.connect(self._on_pivot_changed)
+
+    def addTab(self, widget: QtWidgets.QWidget, icon: FluentIcon, text: str) -> int:
+        index = self._stack.addWidget(widget)
+        route = f"tab_{index}"
+        self._routes.append(route)
+        self._pivot.addItem(route, text, onClick=lambda: self._stack.setCurrentIndex(index), icon=icon)
+        if index == 0:
+            self._pivot.setCurrentItem(route)
+        return index
+
+    def _on_pivot_changed(self, route: str) -> None:
+        if route in self._routes:
+            self._stack.setCurrentIndex(self._routes.index(route))
+
 
 # General application metadata and platform helpers
 APP_NAME = "Stream247"  # Name shown in the GUI and taskbar
