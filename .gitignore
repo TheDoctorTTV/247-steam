@@ -185,3 +185,6 @@ ffmpeg.exe
 yt-dlp.exe
 Flow_Background.mp4
 
+# Node
+node_modules/
+
