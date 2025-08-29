@@ -6,7 +6,7 @@
 # - Saves config to config.json next to the EXE
 # - Overlay shows: "<TITLE> • <Pretty Date>" with title truncation (date preserved)
 
-import os, sys, time, json, random, shutil, subprocess, threading, datetime
+import os, sys, time, json, random, shutil, subprocess, threading, datetime, ctypes
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from pathlib import Path
@@ -24,6 +24,31 @@ if IS_WIN:
     STARTUPINFO = subprocess.STARTUPINFO()
     # Prevent ffmpeg/yt-dlp windows from flashing on screen
     STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # hide windows
+
+
+def apply_mica(win: QtWidgets.QWidget) -> None:
+    """Enable Windows 11 Mica backdrop on the given window."""
+    if not IS_WIN:
+        return
+    hwnd = int(win.winId())
+    try:
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        DWMWA_SYSTEMBACKDROP_TYPE = 38
+        DWMSBT_MAINWINDOW = 2
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(ctypes.c_int(1)),
+            ctypes.sizeof(ctypes.c_int),
+        )
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            ctypes.byref(ctypes.c_int(DWMSBT_MAINWINDOW)),
+            ctypes.sizeof(ctypes.c_int),
+        )
+    except Exception:
+        pass
 
 # ---------- config.json helpers ----------
 def _app_dir() -> Path:
@@ -643,6 +668,10 @@ class MainWindow(QtWidgets.QWidget):
 
         self.on_quality_change()
         self.load_settings()
+        if IS_WIN:
+            self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+            self.setStyleSheet("background: transparent;")
+            apply_mica(self)
 
     # --- settings (config.json) ---
     def load_settings(self):
