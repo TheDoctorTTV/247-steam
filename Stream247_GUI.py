@@ -564,16 +564,6 @@ class MainWindow(QtWidgets.QWidget):
         # --- Tabs ---
         tabs = QtWidgets.QTabWidget()
 
-        # Home Tab
-        home_tab = QtWidgets.QWidget()
-        home_layout = QtWidgets.QVBoxLayout(home_tab)
-        header = QtWidgets.QLabel("Loop your public YouTube VOD playlist to YouTube Live 24/7. Auto-encoder picks NVENC/QSV/AMF/x264.")
-        header.setWordWrap(True)
-        header.setStyleSheet("font-size:14px; color:#b9c2cf;")
-        home_layout.addWidget(header)
-        home_layout.addStretch(1)
-        tabs.addTab(home_tab, "Home")
-
         # Stream Tab
         stream_tab = QtWidgets.QWidget()
         stream_layout = QtWidgets.QVBoxLayout(stream_tab)
@@ -626,7 +616,7 @@ class MainWindow(QtWidgets.QWidget):
         # About Tab
         about_tab = QtWidgets.QWidget()
         about_layout = QtWidgets.QVBoxLayout(about_tab)
-        about_text = QtWidgets.QLabel(f"<b>{APP_NAME}</b>\nVersion 1.0\n\nOpen-source tool to stream YouTube playlists 24/7.")
+        about_text = QtWidgets.QLabel(f"<b>{APP_NAME}</b>\nVersion 1.1.1\n\nOpen-source tool created by TheDoctorTTV, stream your YouTube playlists 24/7.")
         about_text.setWordWrap(True)
         about_layout.addWidget(about_text)
         about_layout.addStretch(1)
@@ -885,6 +875,7 @@ def main():
     w = MainWindow()
     w.setWindowIcon(icon)    # title-bar icon
     w.resize(980, 700)
+    w.setMaximumSize(1280, 900)
     w.show()
     sys.exit(app.exec())
 
