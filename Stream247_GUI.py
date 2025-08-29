@@ -7,7 +7,7 @@
 # - Overlay shows: "<TITLE> • <Pretty Date>" with title truncation (date preserved)
 
 import os, sys, time, json, random, shutil, subprocess, threading, datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -141,7 +141,6 @@ class StreamConfig:
     audio_bitrate: str = "128k"
     overlay_titles: bool = True
     shuffle: bool = False
-    sleep_between: int = 0
     title_file: str = "current_title.txt"
 
     # runtime-selected
@@ -515,7 +514,6 @@ QCheckBox::indicator:unchecked {
 class MainWindow(QtWidgets.QWidget):
     """Main application window housing the GUI and controls."""
 
-    startRequested = QtCore.Signal(StreamConfig)
     stopRequested = QtCore.Signal()
 
     def __init__(self):
@@ -733,7 +731,6 @@ class MainWindow(QtWidgets.QWidget):
             audio_bitrate="128k",
             overlay_titles=self.overlay_chk.isChecked(),
             shuffle=self.shuffle_chk.isChecked(),
-            sleep_between=0,
             title_file="current_title.txt",
         )
 
