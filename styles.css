@@ -1,53 +1,99 @@
+* {
+    margin: 0;
+    padding: 0;
+}
+
+:root {
+    --text-color: #303030;
+    --background-color: #c2c2c2;
+    --card-bg: #fff;
+    --card-shadow: rgba(0, 0, 0, 0.1);
+    --button-bg: #007bff;
+    --button-hover-bg: #0056b3;
+    --border-color: rgba(0, 0, 0, 0.3);
+    --font-size-base: 1rem;
+    --font-size-large: 1.25rem;
+    --radius: 8px;
+}
+
+.darkmode {
+    --text-color: #979797;
+    --background-color: #1b1b1b;
+    --card-bg: #2b2b2b;
+    --card-shadow: rgba(255, 255, 255, 0.1);
+    --button-bg: #a8a8a8;
+    --button-hover-bg: #777;
+    --border-color: rgba(255, 255, 255, 0.3);
+}
+
 body {
-  font-family: Arial, sans-serif;
-  margin: 0;
-  padding: 0;
-  background-color: #f0f0f0;
+    font-family: Kodchasan, Arial, sans-serif;
+    background-color: var(--background-color);
+    color: var(--text-color);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    transition: background-color 0.5s ease, color 0.5s ease;
 }
 
+/* Main card */
 .app {
-  width: 400px;
-  margin: 5rem auto;
-  background: #fff;
-  padding: 2rem;
-  border-radius: 8px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    width: 400px;
+    margin: 2rem;
+    background: var(--card-bg);
+    padding: 2rem;
+    border-radius: var(--radius);
+    box-shadow: 0 0 25px var(--card-shadow);
+    border: 2px solid var(--border-color);
 }
 
+/* Typography */
 .app h1 {
-  margin-top: 0;
-  text-align: center;
+    margin-bottom: 1.5rem;
+    text-align: center;
+    background: linear-gradient(90deg, rgba(149, 0, 255, 1) 0%, rgba(255, 0, 0, 1) 50%);
+    background-clip: text;
+    color: transparent;
+    font-size: var(--font-size-large);
 }
 
 .app div {
-  margin-bottom: 1rem;
-  display: flex;
-  flex-direction: column;
+    margin-bottom: 1rem;
+    display: flex;
+    flex-direction: column;
 }
 
 .app label {
-  margin-bottom: 0.5rem;
-  font-weight: bold;
+    margin-bottom: 0.5rem;
+    font-weight: bold;
 }
 
+/* Inputs */
 .app input {
-  padding: 0.5rem;
-  font-size: 1rem;
-  border: 1px solid #ccc;
-  border-radius: 4px;
+    padding: 0.75rem;
+    font-size: var(--font-size-base);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--background-color);
+    color: var(--text-color);
 }
 
+/* Buttons */
 .app button {
-  padding: 0.75rem;
-  width: 100%;
-  background-color: #007bff;
-  border: none;
-  color: #fff;
-  font-size: 1rem;
-  border-radius: 4px;
-  cursor: pointer;
+    padding: 0.75rem;
+    width: 100%;
+    background: var(--button-bg);
+    border: none;
+    color: #fff;
+    font-size: var(--font-size-base);
+    border-radius: 25px;
+    cursor: pointer;
+    transition: background-color 0.3s ease, box-shadow 0.3s ease;
+    box-shadow: 0 0 10px var(--card-shadow);
 }
 
 .app button:hover {
-  background-color: #0056b3;
+    background-color: var(--button-hover-bg);
+    box-shadow: 0 0 20px var(--card-shadow);
 }
