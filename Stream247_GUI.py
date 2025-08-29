@@ -845,9 +845,17 @@ def main():
     if IS_WIN:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_NAME)
-
-    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps)
-    app = QtWidgets.QApplication(sys.argv)
+    
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps)
+        try:
+            QtGui.QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+                QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+            )
+        except AttributeError:
+            pass
+        app = QtWidgets.QApplication(sys.argv)
 
     # Load .ico (next to EXE when frozen, or cwd when running from source)
     icon = QtGui.QIcon(resource_path("icon.ico"))
