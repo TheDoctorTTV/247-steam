@@ -11,9 +11,14 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
+import urllib.request
+import urllib.error
+import re
 
 # General application metadata and platform helpers
 APP_NAME = "Stream247"  # Name shown in the GUI and taskbar
+APP_VERSION = "1.3"  # Current version
+GITHUB_REPO = "TheDoctorTTV/247-steam"  # GitHub repository for updates
 IS_WIN = (os.name == "nt")  # True when running on Windows
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0  # Hide console windows
 CREATE_NEW_PROCESS_GROUP = 0x00000200 if IS_WIN else 0  # Allow child process killing
@@ -142,6 +147,95 @@ def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts
     if dt is None:
         return None
     return dt.strftime("%b %#d, %Y") if IS_WIN else dt.strftime("%b %-d, %Y")
+
+
+# ---------- update checker ----------
+class UpdateChecker(QtCore.QObject):
+    """Background worker to check for application updates."""
+    
+    update_checked = QtCore.Signal(dict)  # Emits update info
+    error_occurred = QtCore.Signal(str)   # Emits error message
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.repo = GITHUB_REPO
+        
+    @QtCore.Slot()
+    def check_for_updates(self):
+        """Check GitHub releases for newer versions."""
+        try:
+            url = f"https://api.github.com/repos/{self.repo}/releases/latest"
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', f'{APP_NAME}/{APP_VERSION}')
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                
+            # Extract version info
+            latest_version = data.get('tag_name', '').lstrip('v')
+            release_name = data.get('name', '')
+            release_notes = data.get('body', '')
+            release_url = data.get('html_url', '')
+            published_at = data.get('published_at', '')
+            
+            # Parse published date
+            published_date = None
+            if published_at:
+                try:
+                    dt = datetime.datetime.fromisoformat(published_at.replace('Z', '+00:00'))
+                    published_date = dt.strftime("%b %d, %Y")
+                except Exception:
+                    published_date = published_at
+            
+            # Compare versions (simple string comparison for now)
+            current_version = APP_VERSION
+            is_newer = self._is_version_newer(latest_version, current_version)
+            
+            # Find download URL for Windows executable
+            download_url = None
+            assets = data.get('assets', [])
+            for asset in assets:
+                name = asset.get('name', '').lower()
+                if name.endswith('.exe') and 'stream247' in name:
+                    download_url = asset.get('browser_download_url')
+                    break
+            
+            result = {
+                'current_version': current_version,
+                'latest_version': latest_version,
+                'is_newer': is_newer,
+                'release_name': release_name,
+                'release_notes': release_notes,
+                'release_url': release_url,
+                'download_url': download_url,
+                'published_date': published_date
+            }
+            
+            self.update_checked.emit(result)
+            
+        except urllib.error.URLError as e:
+            self.error_occurred.emit(f"Network error: {e}")
+        except json.JSONDecodeError:
+            self.error_occurred.emit("Failed to parse update information")
+        except Exception as e:
+            self.error_occurred.emit(f"Update check failed: {e}")
+    
+    def _is_version_newer(self, latest: str, current: str) -> bool:
+        """Compare version strings to determine if latest is newer than current."""
+        try:
+            # Simple version comparison (handles x.y.z format)
+            latest_parts = [int(x) for x in latest.split('.')]
+            current_parts = [int(x) for x in current.split('.')]
+            
+            # Pad shorter version with zeros
+            max_len = max(len(latest_parts), len(current_parts))
+            latest_parts.extend([0] * (max_len - len(latest_parts)))
+            current_parts.extend([0] * (max_len - len(current_parts)))
+            
+            return latest_parts > current_parts
+        except (ValueError, AttributeError):
+            # Fallback to string comparison
+            return latest != current and latest > current
 
 
 # ---------- streaming core ----------
@@ -601,6 +695,10 @@ class MainWindow(QtWidgets.QWidget):
         self.worker: Optional[StreamWorker] = None
         self.streaming = False
         self.log_fh = None
+        
+        # Update checker components
+        self.update_thread: Optional[QtCore.QThread] = None
+        self.update_checker: Optional[UpdateChecker] = None
 
         # Inputs
         self.playlist_edit = QtWidgets.QLineEdit("")
@@ -628,6 +726,8 @@ class MainWindow(QtWidgets.QWidget):
         self.logfile_chk = QtWidgets.QCheckBox("Log to file")
         self.remember_chk = QtWidgets.QCheckBox("Save playlist and key")
         self.remember_chk.setChecked(True)
+        self.check_updates_startup_chk = QtWidgets.QCheckBox("Check for updates on startup")
+        self.check_updates_startup_chk.setChecked(True)
 
         self.console = QtWidgets.QTextEdit()
         self.console.setReadOnly(True)
@@ -702,10 +802,49 @@ class MainWindow(QtWidgets.QWidget):
         # About Tab
         about_tab = QtWidgets.QWidget()
         about_layout = QtWidgets.QVBoxLayout(about_tab)
-        about_text = QtWidgets.QLabel(f"<b>{APP_NAME}</b>\nVersion 1.3\n\nOpen-source tool created by TheDoctorTTV, stream your YouTube playlists 24/7.")
+        
+        # Version info
+        version_layout = QtWidgets.QHBoxLayout()
+        about_text = QtWidgets.QLabel(f"<b>{APP_NAME}</b> - YouTube 24/7 VOD Streamer<br>Version {APP_VERSION}")
         about_text.setWordWrap(True)
-        about_layout.addWidget(about_text)
+        version_layout.addWidget(about_text)
+        version_layout.addStretch(1)
+        
+        # Update checker section
+        update_group = QtWidgets.QGroupBox("Updates")
+        update_group_layout = QtWidgets.QVBoxLayout(update_group)
+        
+        # Update status and buttons
+        update_controls_layout = QtWidgets.QHBoxLayout()
+        self.check_update_btn = QtWidgets.QPushButton("Check for Updates")
+        self.check_update_btn.clicked.connect(self.check_for_updates)
+        update_controls_layout.addWidget(self.check_update_btn)
+        update_controls_layout.addStretch(1)
+        
+        # Update status label
+        self.update_status_label = QtWidgets.QLabel("Click 'Check for Updates' to check for new versions")
+        self.update_status_label.setWordWrap(True)
+        self.update_status_label.setStyleSheet("color: #888; font-style: italic;")
+        
+        # Check on startup toggle
+        startup_check_layout = QtWidgets.QHBoxLayout()
+        startup_check_layout.addWidget(self.check_updates_startup_chk)
+        startup_check_layout.addStretch(1)
+        
+        update_group_layout.addLayout(update_controls_layout)
+        update_group_layout.addWidget(self.update_status_label)
+        update_group_layout.addLayout(startup_check_layout)
+        
+        # Credits
+        credits_text = QtWidgets.QLabel("Open-source tool created by TheDoctorTTV<br>"
+                                       f"<a href='https://github.com/{GITHUB_REPO}' style='color: #5DADE2;'>GitHub Repository</a>")
+        credits_text.setWordWrap(True)
+        credits_text.setOpenExternalLinks(True)
+        
+        about_layout.addLayout(version_layout)
+        about_layout.addWidget(update_group)
         about_layout.addStretch(1)
+        about_layout.addWidget(credits_text)
         tabs.addTab(about_tab, "About")
 
         main_layout = QtWidgets.QVBoxLayout(self)
@@ -727,11 +866,16 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay_chk.toggled.connect(lambda _: self.save_settings())
         self.shuffle_chk.toggled.connect(lambda _: self.save_settings())
         self.logfile_chk.toggled.connect(lambda _: self.save_settings())
+        self.check_updates_startup_chk.toggled.connect(lambda _: self.save_settings())
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.fps_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
         self.rtmp_edit.textChanged.connect(lambda _: self.save_settings())
+        
+        # Check for updates on startup if enabled
+        if self.check_updates_startup_chk.isChecked():
+            QtCore.QTimer.singleShot(2000, self.check_for_updates_silent)
 
     # --- settings (config.json) ---
     def load_settings(self):
@@ -748,6 +892,7 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay_chk.setChecked(bool(cfg.get("overlay_titles", True)))
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
         self.logfile_chk.setChecked(bool(cfg.get("log_to_file", False)))
+        self.check_updates_startup_chk.setChecked(bool(cfg.get("check_updates_startup", True)))
 
         if "resolution" in cfg:
             idx = self.res_combo.findText(cfg["resolution"])
@@ -772,6 +917,7 @@ class MainWindow(QtWidgets.QWidget):
             "overlay_titles": self.overlay_chk.isChecked(),
             "shuffle": self.shuffle_chk.isChecked(),
             "log_to_file": self.logfile_chk.isChecked(),
+            "check_updates_startup": self.check_updates_startup_chk.isChecked(),
             "resolution": self.res_combo.currentText(),
             "framerate": int(self.fps_combo.currentText()),
             "video_bitrate": self.bitrate_edit.text().strip(),
@@ -836,6 +982,150 @@ class MainWindow(QtWidgets.QWidget):
             shuffle=self.shuffle_chk.isChecked(),
             title_file="current_title.txt",
         )
+
+    # --- update checker ---
+    def check_for_updates(self):
+        """Manually check for updates (triggered by button click)."""
+        if self.update_thread and self.update_thread.isRunning():
+            return  # Already checking
+            
+        self.check_update_btn.setEnabled(False)
+        self.check_update_btn.setText("Checking...")
+        self.update_status_label.setText("Checking for updates...")
+        self.update_status_label.setStyleSheet("color: #888; font-style: italic;")
+        
+        self._start_update_check()
+    
+    def check_for_updates_silent(self):
+        """Silently check for updates on startup."""
+        if self.update_thread and self.update_thread.isRunning():
+            return  # Already checking
+            
+        self._start_update_check()
+    
+    def _start_update_check(self):
+        """Start the update checking process in a background thread."""
+        self.update_thread = QtCore.QThread(self)
+        self.update_checker = UpdateChecker()
+        self.update_checker.moveToThread(self.update_thread)
+        
+        self.update_thread.started.connect(self.update_checker.check_for_updates)
+        self.update_checker.update_checked.connect(self._on_update_checked)
+        self.update_checker.error_occurred.connect(self._on_update_error)
+        self.update_checker.update_checked.connect(self.update_thread.quit)
+        self.update_checker.error_occurred.connect(self.update_thread.quit)
+        self.update_thread.finished.connect(self._on_update_check_finished)
+        
+        self.update_thread.start()
+    
+    def _on_update_checked(self, update_info: dict):
+        """Handle successful update check."""
+        current_version = update_info.get('current_version', APP_VERSION)
+        latest_version = update_info.get('latest_version', 'Unknown')
+        is_newer = update_info.get('is_newer', False)
+        release_url = update_info.get('release_url', '')
+        download_url = update_info.get('download_url', '')
+        published_date = update_info.get('published_date', '')
+        
+        if is_newer:
+            # Update available
+            self.update_status_label.setText(
+                f"<b>Update available!</b> v{latest_version} "
+                f"(Current: v{current_version})"
+            )
+            self.update_status_label.setStyleSheet("color: #5DADE2; font-weight: bold;")
+            
+            # Show update dialog
+            self._show_update_dialog(update_info)
+        else:
+            # Up to date
+            self.update_status_label.setText(f"You're up to date! (v{current_version})")
+            self.update_status_label.setStyleSheet("color: #58D68D; font-weight: bold;")
+    
+    def _on_update_error(self, error_message: str):
+        """Handle update check error."""
+        self.update_status_label.setText(f"Update check failed: {error_message}")
+        self.update_status_label.setStyleSheet("color: #E74C3C; font-style: italic;")
+    
+    def _on_update_check_finished(self):
+        """Re-enable the check button after update check completes."""
+        self.check_update_btn.setEnabled(True)
+        self.check_update_btn.setText("Check for Updates")
+        
+        # Clean up
+        if self.update_thread:
+            self.update_thread.deleteLater()
+            self.update_thread = None
+        if self.update_checker:
+            self.update_checker.deleteLater()
+            self.update_checker = None
+    
+    def _show_update_dialog(self, update_info: dict):
+        """Show a dialog with update information."""
+        latest_version = update_info.get('latest_version', 'Unknown')
+        release_name = update_info.get('release_name', '')
+        release_notes = update_info.get('release_notes', '')
+        release_url = update_info.get('release_url', '')
+        download_url = update_info.get('download_url', '')
+        published_date = update_info.get('published_date', '')
+        
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Update Available - {APP_NAME}")
+        dialog.setMinimumWidth(500)
+        dialog.setMinimumHeight(400)
+        
+        layout = QtWidgets.QVBoxLayout(dialog)
+        
+        # Header
+        header = QtWidgets.QLabel(f"<h2>Update Available!</h2>")
+        layout.addWidget(header)
+        
+        # Version info
+        version_text = f"<b>Current Version:</b> {APP_VERSION}<br>"
+        version_text += f"<b>Latest Version:</b> {latest_version}"
+        if published_date:
+            version_text += f"<br><b>Released:</b> {published_date}"
+        
+        version_label = QtWidgets.QLabel(version_text)
+        layout.addWidget(version_label)
+        
+        # Release notes
+        if release_notes:
+            notes_label = QtWidgets.QLabel("<b>Release Notes:</b>")
+            layout.addWidget(notes_label)
+            
+            notes_text = QtWidgets.QTextEdit()
+            notes_text.setPlainText(release_notes)
+            notes_text.setMaximumHeight(200)
+            notes_text.setReadOnly(True)
+            layout.addWidget(notes_text)
+        
+        # Buttons
+        button_layout = QtWidgets.QHBoxLayout()
+        
+        if download_url:
+            download_btn = QtWidgets.QPushButton("Download Update")
+            download_btn.clicked.connect(lambda: self._open_url(download_url))
+            button_layout.addWidget(download_btn)
+        
+        if release_url:
+            view_btn = QtWidgets.QPushButton("View on GitHub")
+            view_btn.clicked.connect(lambda: self._open_url(release_url))
+            button_layout.addWidget(view_btn)
+        
+        button_layout.addStretch()
+        
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        button_layout.addWidget(close_btn)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.exec()
+    
+    def _open_url(self, url: str):
+        """Open URL in default browser."""
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
     # --- start/stop wiring ---
     def on_start(self):
