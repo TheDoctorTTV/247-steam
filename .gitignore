@@ -184,3 +184,4 @@ cython_debug/
 ffmpeg.exe
 yt-dlp.exe
 Flow_Background.mp4
+build_and_sign.bat
