@@ -77,11 +77,29 @@ def find_ffmpeg() -> Optional[str]:
 
 def find_ytdlp() -> Optional[str]:
     """Locate a yt-dlp binary in PATH or alongside the executable."""
-    return find_binary(["yt-dlp.exe", "yt-dlp"])
+    # First try the Python-installed version (usually more up-to-date)
+    candidates = ["yt-dlp", "yt-dlp.exe"]
+    
+    # Check PATH first
+    for c in candidates:
+        p = shutil.which(c)
+        if p:
+            return p
+    
+    # Then check local resources
+    for c in ["yt-dlp.exe", "yt-dlp"]:
+        rp = resource_path(c)
+        if Path(rp).exists():
+            return rp
+    
+    return None
 
 def run_hidden(cmd: List[str], check=False, capture=True, text=True, timeout=None) -> subprocess.CompletedProcess:
     """Run a subprocess without showing a console window."""
-    kwargs = dict(startupinfo=STARTUPINFO, creationflags=CREATE_NO_WINDOW)
+    kwargs = {}
+    if IS_WIN:
+        kwargs["startupinfo"] = STARTUPINFO
+        kwargs["creationflags"] = CREATE_NO_WINDOW
     if capture:
         kwargs.update(dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text))
     return subprocess.run(cmd, check=check, timeout=timeout, **kwargs)
@@ -148,6 +166,7 @@ class StreamConfig:
     encoder_name: str = "CPU x264"
     pix_fmt: str = "yuv420p"
     extra_venc_flags: List[str] = None  # type: ignore
+    _overlay_fontsize: int = 24  # Optional runtime field for overlay fontsize
 
     def rtmp_url(self) -> str:
         """Construct the full RTMP URL using the base and stream key."""
@@ -221,11 +240,22 @@ class StreamWorker(QtCore.QObject):
         """Return a list of video IDs contained in a YouTube playlist."""
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found. Put it next to the EXE or in PATH.")
+        
+        self.log.emit(f"[INFO] Extracting playlist IDs from: {playlist_url}")
         cmd = [self.ytdlp_path, "--ignore-errors", "--flat-playlist", "--get-id", playlist_url]
         cp = run_hidden(cmd)
         if cp.returncode != 0:
             raise RuntimeError(f"yt-dlp error: {cp.stderr.strip()}")
-        return [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
+        
+        ids = [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
+        self.log.emit(f"[INFO] Found {len(ids)} videos in playlist")
+        
+        if len(ids) > 10:
+            self.log.emit(f"[INFO] First 10 video IDs: {ids[:10]}")
+        else:
+            self.log.emit(f"[INFO] Video IDs: {ids}")
+            
+        return ids
 
     def get_metadata(self, video_id: str) -> Tuple[str, Optional[str]]:
         """Fetch the title and upload date for a video."""
@@ -256,14 +286,36 @@ class StreamWorker(QtCore.QObject):
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found.")
         url = f"https://www.youtube.com/watch?v={video_id}"
-        fmt = "bv*+ba/best"
-        cp = run_hidden([self.ytdlp_path, "-g", "-f", fmt, url])
-        if cp.returncode != 0:
-            raise RuntimeError(f"yt-dlp -g failed: {cp.stderr.strip()}")
-        lines = [ln.strip() for ln in (cp.stdout or "").splitlines() if ln.strip()]
-        if not lines:
-            raise RuntimeError("No playable formats found.")
-        return (lines[0], None) if len(lines) == 1 else (lines[0], lines[1])
+        
+        # Try multiple format strategies for better compatibility
+        format_strategies = [
+            "bv*+ba/best",  # Best video + best audio (separate)
+            "best[height<=?1080]",  # Best combined format up to 1080p
+            "worst[height>=480]",  # Fallback to worst acceptable quality
+            "best"  # Last resort - any available format
+        ]
+        
+        for fmt in format_strategies:
+            try:
+                cp = run_hidden([self.ytdlp_path, "-g", "-f", fmt, url])
+                if cp.returncode == 0 and cp.stdout:
+                    lines = [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
+                    if lines:
+                        return (lines[0], None) if len(lines) == 1 else (lines[0], lines[1])
+            except Exception:
+                continue
+                
+        # If all strategies fail, try without format specification
+        try:
+            cp = run_hidden([self.ytdlp_path, "-g", url])
+            if cp.returncode == 0 and cp.stdout:
+                lines = [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
+                if lines:
+                    return (lines[0], None) if len(lines) == 1 else (lines[0], lines[1])
+        except Exception:
+            pass
+            
+        raise RuntimeError(f"No playable formats found for video {video_id}. This may be due to YouTube restrictions or an outdated yt-dlp version.")
 
     # ---------- encoder selection ----------
     def select_encoder(self):
@@ -303,7 +355,7 @@ class StreamWorker(QtCore.QObject):
         vf = [f"scale=-2:{self.cfg.height}:flags=bicubic"]
         if self.cfg.overlay_titles:
             title_file = Path(self.cfg.title_file).as_posix().replace(":", r"\:").replace("'", r"\\'")
-            fontsize = getattr(self.cfg, "_overlay_fontsize", 24)
+            fontsize = self.cfg._overlay_fontsize
             vf.append(
                 f"drawtext=textfile='{title_file}':reload=1:"
                 f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
@@ -339,26 +391,36 @@ class StreamWorker(QtCore.QObject):
 
     def run_one_video(self, video_id: str):
         """Stream a single video using ffmpeg."""
-        # Title + date overlay (truncate title; keep date intact)
-        title, pretty_date = self.get_metadata(video_id)
-        if self.cfg.overlay_titles:
-            suffix = f" • {pretty_date}" if pretty_date else ""
-            title_clean = (title or "").replace("\n", " ").strip()
+        try:
+            # Title + date overlay (truncate title; keep date intact)
+            title, pretty_date = self.get_metadata(video_id)
+            if self.cfg.overlay_titles:
+                suffix = f" • {pretty_date}" if pretty_date else ""
+                title_clean = (title or "").replace("\n", " ").strip()
 
-            MAX_LEN = 75  # total length including suffix
-            if len(title_clean) + len(suffix) > MAX_LEN:
-                avail = max(10, MAX_LEN - len(suffix) - 3)  # leave room for "..."
-                title_clean = title_clean[:avail] + "..."
+                MAX_LEN = 75  # total length including suffix
+                if len(title_clean) + len(suffix) > MAX_LEN:
+                    avail = max(10, MAX_LEN - len(suffix) - 3)  # leave room for "..."
+                    title_clean = title_clean[:avail] + "..."
 
-            overlay_text = title_clean + suffix
-            self.cfg._overlay_fontsize = 24
-            safe_write_text(Path(self.cfg.title_file), overlay_text)
-        else:
-            if hasattr(self.cfg, "_overlay_fontsize"):
-                delattr(self.cfg, "_overlay_fontsize")
+                overlay_text = title_clean + suffix
+                self.cfg._overlay_fontsize = 24
+                safe_write_text(Path(self.cfg.title_file), overlay_text)
+            else:
+                # Reset fontsize to default when overlay is disabled
+                self.cfg._overlay_fontsize = 24
 
-        # Direct URLs and ffmpeg run (hidden window, own process group)
-        vurl, aurl = self.get_stream_urls(video_id)
+            # Direct URLs and ffmpeg run (hidden window, own process group)
+            vurl, aurl = self.get_stream_urls(video_id)
+            self.log.emit(f"[INFO] Video URL obtained successfully for {video_id}")
+            
+        except Exception as e:
+            self.log.emit(f"[ERROR] Failed to get video info for {video_id}: {e}")
+            # Try to check if video is available at all
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            self.log.emit(f"[INFO] Video might be private, deleted, or region-restricted: {url}")
+            return  # Skip this video and continue
+
         ff_cmd = self.build_ffmpeg_cmd(vurl, aurl)
         self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
         self._skip.clear()
@@ -465,7 +527,11 @@ class StreamWorker(QtCore.QObject):
                     try:
                         self.run_one_video(vid)
                     except Exception as e:
-                        self.log.emit(f"[WARN] Stream error: {e}")
+                        self.log.emit(f"[WARN] Stream error for video {vid}: {e}")
+                        self.log.emit("[INFO] Continuing to next video...")
+                        # Add a small delay before trying the next video
+                        if not self._stop.is_set():
+                            time.sleep(2)
 
                     if self._stop.is_set():
                         break
@@ -512,16 +578,15 @@ QCheckBox::indicator:unchecked {
 class MainWindow(QtWidgets.QWidget):
     """Main application window housing the GUI and controls."""
 
-    QUALITY_PRESETS = {
-        "480p30": (30, 480, "1000k", "2000k"),
-        "480p60": (60, 480, "1500k", "3000k"),
-        "720p30": (30, 720, "3000k", "4600k"),
-        "720p60": (60, 720, "6000k", "6400k"),
-        "1080p30": (30, 1080, "10000k", "9000k"),
-        "1080p60": (60, 1080, "12000k", "12000k"),
-        "1440p60": (60, 1440, "3500k", "12000k"),
-        "2160p60": (60, 2160, "35000k", "12000k")
+    RESOLUTION_PRESETS = {
+        "480p": (480, "1000k", "2000k"),
+        "720p": (720, "2300k", "4600k"),
+        "1080p": (1080, "6000k", "9000k"),
+        "1440p": (1440, "9000k", "12000k"),
+        "2160p": (2160, "35000k", "35000k")
     }
+    
+    FRAMERATE_OPTIONS = [30, 60]
 
     stopRequested = QtCore.Signal()
 
@@ -540,13 +605,20 @@ class MainWindow(QtWidgets.QWidget):
         # Inputs
         self.playlist_edit = QtWidgets.QLineEdit("")
         self.playlist_edit.setPlaceholderText("Your YouTube playlist URL…")
+        self.rtmp_edit = QtWidgets.QLineEdit("rtmp://a.rtmp.youtube.com/live2")
+        self.rtmp_edit.setPlaceholderText("RTMP ingest URL (e.g., rtmp://a.rtmp.youtube.com/live2)")
         self.key_edit = QtWidgets.QLineEdit("")
         self.key_edit.setPlaceholderText("Your YouTube stream key…")
-        self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
 
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["480p30", "480p60", "720p30", "720p60", "1080p30", "1080p60", "1440p60", "2160p60"])
-        self.res_combo.setCurrentText("720p30")
+        self.res_combo.addItems(["480p", "720p", "1080p", "1440p", "2160p"])
+        self.res_combo.setCurrentText("720p")
+        
+        self.fps_combo = QtWidgets.QComboBox()
+        self.fps_combo.addItems(["30", "60"])
+        self.fps_combo.setCurrentText("30")
+        
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
 
@@ -577,8 +649,10 @@ class MainWindow(QtWidgets.QWidget):
         stream_form = QtWidgets.QGridLayout()
         stream_form.addWidget(QtWidgets.QLabel("Playlist URL"), 0, 0)
         stream_form.addWidget(self.playlist_edit, 0, 1, 1, 3)
-        stream_form.addWidget(QtWidgets.QLabel("Stream Key"), 1, 0)
-        stream_form.addWidget(self.key_edit, 1, 1, 1, 3)
+        stream_form.addWidget(QtWidgets.QLabel("Stream URL"), 1, 0)
+        stream_form.addWidget(self.rtmp_edit, 1, 1, 1, 3)
+        stream_form.addWidget(QtWidgets.QLabel("Stream Key"), 2, 0)
+        stream_form.addWidget(self.key_edit, 2, 1, 1, 3)
         stream_layout.addLayout(stream_form)
 
         btns = QtWidgets.QHBoxLayout()
@@ -600,10 +674,12 @@ class MainWindow(QtWidgets.QWidget):
         settings_layout = QtWidgets.QVBoxLayout(settings_tab)
 
         settings_form = QtWidgets.QGridLayout()
-        settings_form.addWidget(QtWidgets.QLabel("Quality"), 0, 0)
+        settings_form.addWidget(QtWidgets.QLabel("Resolution"), 0, 0)
         settings_form.addWidget(self.res_combo, 0, 1)
-        settings_form.addWidget(QtWidgets.QLabel("Video Bitrate"), 0, 2)
-        settings_form.addWidget(self.bitrate_edit, 0, 3)
+        settings_form.addWidget(QtWidgets.QLabel("Frame Rate"), 0, 2)
+        settings_form.addWidget(self.fps_combo, 0, 3)
+        settings_form.addWidget(QtWidgets.QLabel("Video Bitrate"), 1, 0)
+        settings_form.addWidget(self.bitrate_edit, 1, 1)
         settings_form.addWidget(QtWidgets.QLabel("Buffer Size"), 1, 2)
         settings_form.addWidget(self.bufsize_edit, 1, 3)
         settings_layout.addLayout(settings_form)
@@ -626,7 +702,7 @@ class MainWindow(QtWidgets.QWidget):
         # About Tab
         about_tab = QtWidgets.QWidget()
         about_layout = QtWidgets.QVBoxLayout(about_tab)
-        about_text = QtWidgets.QLabel(f"<b>{APP_NAME}</b>\nVersion 1.1.1\n\nOpen-source tool created by TheDoctorTTV, stream your YouTube playlists 24/7.")
+        about_text = QtWidgets.QLabel(f"<b>{APP_NAME}</b>\nVersion 1.3\n\nOpen-source tool created by TheDoctorTTV, stream your YouTube playlists 24/7.")
         about_text.setWordWrap(True)
         about_layout.addWidget(about_text)
         about_layout.addStretch(1)
@@ -640,6 +716,7 @@ class MainWindow(QtWidgets.QWidget):
         self.stop_btn.clicked.connect(self.on_stop)
         self.skip_btn.clicked.connect(self.on_skip)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
+        self.fps_combo.currentIndexChanged.connect(self.on_quality_change)
 
         # restore persisted settings before wiring save handlers
         self.on_quality_change()
@@ -651,8 +728,10 @@ class MainWindow(QtWidgets.QWidget):
         self.shuffle_chk.toggled.connect(lambda _: self.save_settings())
         self.logfile_chk.toggled.connect(lambda _: self.save_settings())
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
+        self.fps_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
+        self.rtmp_edit.textChanged.connect(lambda _: self.save_settings())
 
     # --- settings (config.json) ---
     def load_settings(self):
@@ -663,16 +742,23 @@ class MainWindow(QtWidgets.QWidget):
 
         if remember:
             self.playlist_edit.setText(cfg.get("playlist_url", ""))
+            self.rtmp_edit.setText(cfg.get("rtmp_base", "rtmp://a.rtmp.youtube.com/live2"))
             self.key_edit.setText(cfg.get("stream_key", ""))
 
         self.overlay_chk.setChecked(bool(cfg.get("overlay_titles", True)))
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
         self.logfile_chk.setChecked(bool(cfg.get("log_to_file", False)))
 
-        if "quality" in cfg:
-            idx = self.res_combo.findText(cfg["quality"])
+        if "resolution" in cfg:
+            idx = self.res_combo.findText(cfg["resolution"])
             if idx >= 0:
                 self.res_combo.setCurrentIndex(idx)
+        
+        if "framerate" in cfg:
+            idx = self.fps_combo.findText(str(cfg["framerate"]))
+            if idx >= 0:
+                self.fps_combo.setCurrentIndex(idx)
+                
         if "video_bitrate" in cfg:
             self.bitrate_edit.setText(cfg["video_bitrate"])
         if "bufsize" in cfg:
@@ -686,15 +772,18 @@ class MainWindow(QtWidgets.QWidget):
             "overlay_titles": self.overlay_chk.isChecked(),
             "shuffle": self.shuffle_chk.isChecked(),
             "log_to_file": self.logfile_chk.isChecked(),
-            "quality": self.res_combo.currentText(),
+            "resolution": self.res_combo.currentText(),
+            "framerate": int(self.fps_combo.currentText()),
             "video_bitrate": self.bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
         })
         if self.remember_chk.isChecked():
             data["playlist_url"] = self.playlist_edit.text().strip()
+            data["rtmp_base"] = self.rtmp_edit.text().strip()
             data["stream_key"] = self.key_edit.text().strip()
         else:
             data.pop("playlist_url", None)
+            data.pop("rtmp_base", None)
             data.pop("stream_key", None)
         save_config_json(data)
 
@@ -707,7 +796,7 @@ class MainWindow(QtWidgets.QWidget):
     def append_log(self, text: str):
         """Append text to the on-screen console and optional log file."""
         self.console.append(text)
-        self.console.moveCursor(QtGui.QTextCursor.End)
+        self.console.moveCursor(QtGui.QTextCursor.MoveOperation.End)
         if self.log_fh:
             try:
                 self.log_fh.write(text + "\n")
@@ -717,21 +806,27 @@ class MainWindow(QtWidgets.QWidget):
 
     def on_quality_change(self):
         """Update internal FPS/height presets when the quality dropdown changes."""
-        choice = self.res_combo.currentText()
-        fps, height, bitrate, bufsize = self.QUALITY_PRESETS.get(
-            choice, self.QUALITY_PRESETS["1080p60"]
+        resolution = self.res_combo.currentText()
+        framerate = int(self.fps_combo.currentText())
+        
+        height, suggested_bitrate, suggested_bufsize = self.RESOLUTION_PRESETS.get(
+            resolution, self.RESOLUTION_PRESETS["720p"]
         )
-        self._fps = fps
+        
+        self._fps = framerate
         self._height = height
+        
+        # Only update bitrate/bufsize if not currently streaming
         if not self.streaming:
-            self.bitrate_edit.setText(bitrate)
-            self.bufsize_edit.setText(bufsize)
+            self.bitrate_edit.setText(suggested_bitrate)
+            self.bufsize_edit.setText(suggested_bufsize)
 
     def make_config(self) -> StreamConfig:
         """Create a StreamConfig from the current UI state."""
         return StreamConfig(
             playlist_url=self.playlist_edit.text().strip(),
             stream_key=self.key_edit.text().strip(),
+            rtmp_base=self.rtmp_edit.text().strip(),
             fps=self._fps,
             height=self._height,
             video_bitrate=self.bitrate_edit.text().strip(),
@@ -748,8 +843,8 @@ class MainWindow(QtWidgets.QWidget):
         if self.streaming:
             return
         cfg = self.make_config()
-        if not cfg.playlist_url or not cfg.stream_key:
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "Please enter Playlist URL and Stream Key.")
+        if not cfg.playlist_url or not cfg.rtmp_base or not cfg.stream_key:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "Please enter Playlist URL, Stream URL, and Stream Key.")
             return
 
         # save settings right when starting (if 'remember' is checked)
@@ -851,7 +946,9 @@ def main():
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_NAME)
 
-    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps)
+    # Set environment variable for high DPI support before creating QApplication
+    os.environ['QT_ENABLE_HIGHDPI_SCALING'] = '1'
+
     app = QtWidgets.QApplication(sys.argv)
 
     # Load .ico (next to EXE when frozen, or cwd when running from source)
