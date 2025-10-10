@@ -6,7 +6,8 @@
 # - Saves config to config.json next to the EXE
 # - Overlay shows: "<TITLE> • <Pretty Date>" with title truncation (date preserved)
 
-import os, sys, time, json, random, shutil, subprocess, threading, datetime
+import os, sys, time, json, random, shutil, subprocess, threading, datetime, webbrowser
+import zipfile, tempfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from pathlib import Path
@@ -56,6 +57,7 @@ def save_config_json(data: dict) -> None:
         pass
 
 # ---------- misc utilities ----------
+# (Removed: default browser detection helpers)
 def resource_path(name: str) -> str:
     """Resolve a resource path for frozen executables or source runs."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
@@ -63,6 +65,40 @@ def resource_path(name: str) -> str:
     if p.exists():
         return str(p)
     return str(Path.cwd() / name)
+
+def find_drawtext_fontfile() -> Optional[str]:
+    """Return a font file path suitable for ffmpeg drawtext across platforms.
+
+    Tries common system fonts on Windows, macOS, and Linux. Returns None if not found.
+    """
+    candidates: List[Path] = []
+    if IS_WIN:
+        windir = os.environ.get("WINDIR", r"C:\\Windows")
+        candidates += [
+            Path(windir) / "Fonts" / name
+            for name in ("segoeui.ttf", "arial.ttf", "calibri.ttf", "tahoma.ttf")
+        ]
+    else:
+        # macOS common font locations
+        candidates += [
+            Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+            Path("/Library/Fonts/Arial.ttf"),
+            Path("/System/Library/Fonts/Supplemental/Helvetica.ttc"),
+            Path("/System/Library/Fonts/Helvetica.ttc"),
+        ]
+        # Linux common fonts
+        candidates += [
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/share/fonts/truetype/freefont/FreeSans.ttf"),
+            Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+        ]
+    for p in candidates:
+        try:
+            if p.exists():
+                return p.as_posix()
+        except Exception:
+            continue
+    return None
 
 def find_binary(candidates: List[str]) -> Optional[str]:
     """Search PATH and local resources for the first existing executable."""
@@ -98,6 +134,69 @@ def find_ytdlp() -> Optional[str]:
             return rp
     
     return None
+
+def _download_url(url: str, dest_path: Path, user_agent: Optional[str] = None) -> None:
+    """Download a URL to dest_path atomically.
+
+    Uses a temp file then renames into place to avoid partial files on failure.
+    """
+    headers = {}
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        total = resp.length or 0
+        # Write to a temporary file first
+        with tempfile.NamedTemporaryFile(delete=False, dir=str(dest_path.parent)) as tf:
+            while True:
+                chunk = resp.read(1024 * 64)
+                if not chunk:
+                    break
+                tf.write(chunk)
+            tmp_name = tf.name
+    # Ensure parent exists
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    # Replace existing file if present
+    Path(tmp_name).replace(dest_path)
+
+def github_latest_asset_url(repo: str, prefer_substrings: List[str], must_match_regex: str = ".*", user_agent: Optional[str] = None) -> Optional[str]:
+    """Return browser_download_url of an asset from latest GitHub release.
+
+    Args:
+      repo: "owner/name" form
+      prefer_substrings: list of substrings to prioritize in asset name order
+      must_match_regex: regex that asset name must match
+    """
+    try:
+        url = f"https://api.github.com/repos/{repo}/releases/latest"
+        headers = {"Accept": "application/vnd.github+json"}
+        if user_agent:
+            headers["User-Agent"] = user_agent
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        assets = data.get("assets", [])
+        if not assets:
+            return None
+        regex = re.compile(must_match_regex)
+        # Filter by regex
+        filtered = [a for a in assets if regex.search(a.get("name", ""))]
+        if not filtered:
+            return None
+        # Prefer entries containing preferred substrings in order
+        def score(name: str) -> Tuple[int, int]:
+            pri = len(prefer_substrings)
+            for i, sub in enumerate(prefer_substrings):
+                if sub.lower() in name.lower():
+                    pri = i
+                    break
+            # Prefer smaller files might have shorter names; secondary metric by length
+            return (pri, len(name))
+
+        best = min(filtered, key=lambda a: score(a.get("name", "")))
+        return best.get("browser_download_url")
+    except Exception:
+        return None
 
 def run_hidden(cmd: List[str], check=False, capture=True, text=True, timeout=None) -> subprocess.CompletedProcess:
     """Run a subprocess without showing a console window."""
@@ -254,6 +353,7 @@ class StreamConfig:
     overlay_titles: bool = True
     shuffle: bool = False
     title_file: str = "current_title.txt"
+    rtmp_live: bool = False
 
     # runtime-selected
     encoder: str = "libx264"
@@ -285,6 +385,214 @@ class StreamWorker(QtCore.QObject):
         self.ffmpeg_path = find_ffmpeg()
         self.ytdlp_path = find_ytdlp()
         self.ff_proc = None
+        # (YouTube auth config removed)
+
+    def _ytdlp_cookies_args(self) -> List[str]:
+        """Return yt-dlp auth arguments. Cookies disabled (no auth needed)."""
+        return []
+
+    # ---------- dependency ensure / auto-download ----------
+    def ensure_binaries(self, force: bool = False):
+        """Ensure yt-dlp and ffmpeg are available; try to auto-download on Windows.
+
+        - yt-dlp: download latest Windows exe from GitHub if missing
+        - ffmpeg: download prebuilt gyan.dev latest zip if missing and extract ffmpeg.exe
+        """
+        if not IS_WIN:
+            # On non-Windows, we don't attempt auto-install; rely on PATH.
+            return
+
+        app_dir = _app_dir()
+
+        # Ensure a local yt-dlp.exe next to the EXE and prefer using it
+        local_ytdlp = app_dir / "yt-dlp.exe"
+        if force and local_ytdlp.exists():
+            try:
+                local_ytdlp.unlink()
+            except Exception:
+                pass
+        if not local_ytdlp.exists():
+            try:
+                self.log.emit("[INFO] yt-dlp.exe not found next to the app — downloading latest release…")
+                # Use GitHub latest/download stable filename; fallback to API lookup
+                ytdlp_url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+                _download_url(ytdlp_url, local_ytdlp, user_agent=f"{APP_NAME}/{APP_VERSION}")
+                try:
+                    os.chmod(local_ytdlp, 0o755)
+                except Exception:
+                    pass
+                self.log.emit("[INFO] Downloaded yt-dlp.exe")
+            except Exception:
+                # Fallback via API
+                alt = github_latest_asset_url(
+                    "yt-dlp/yt-dlp",
+                    prefer_substrings=["yt-dlp.exe"],
+                    must_match_regex=r"yt-dlp.*\.exe$",
+                    user_agent=f"{APP_NAME}/{APP_VERSION}"
+                )
+                if alt:
+                    try:
+                        _download_url(alt, local_ytdlp, user_agent=f"{APP_NAME}/{APP_VERSION}")
+                        try:
+                            os.chmod(local_ytdlp, 0o755)
+                        except Exception:
+                            pass
+                        self.log.emit("[INFO] Downloaded yt-dlp.exe via API fallback")
+                    except Exception as e2:
+                        self.log.emit(f"[WARN] Failed to download yt-dlp.exe automatically: {e2}")
+                else:
+                    self.log.emit("[WARN] Could not determine latest yt-dlp.exe download URL")
+        # Prefer local copy if available
+        if local_ytdlp.exists():
+            self.ytdlp_path = str(local_ytdlp)
+
+        # Ensure a local ffmpeg.exe next to the EXE and prefer using it
+        local_ffmpeg = app_dir / "ffmpeg.exe"
+        if force and local_ffmpeg.exists():
+            try:
+                local_ffmpeg.unlink()
+            except Exception:
+                pass
+        if not local_ffmpeg.exists():
+            try:
+                self.log.emit("[INFO] ffmpeg.exe not found next to the app — downloading latest Windows build…")
+                # Find a recent Windows x64 zip from BtbN/FFmpeg-Builds via API
+                ff_zip_api_url = github_latest_asset_url(
+                    "BtbN/FFmpeg-Builds",
+                    prefer_substrings=["win64", "lgpl", "shared", "zip"],
+                    must_match_regex=r"ffmpeg-.*win64.*zip$",
+                    user_agent=f"{APP_NAME}/{APP_VERSION}"
+                )
+                if not ff_zip_api_url:
+                    raise RuntimeError("Could not determine latest FFmpeg Windows zip from GitHub API")
+                dest_zip = app_dir / "ffmpeg-latest.zip"
+                _download_url(ff_zip_api_url, dest_zip, user_agent=f"{APP_NAME}/{APP_VERSION}")
+
+                # Extract ffmpeg.exe
+                ffmpeg_exe_path: Optional[Path] = None
+                try:
+                    with zipfile.ZipFile(dest_zip, 'r') as zf:
+                        # Find ffmpeg.exe inside the archive (path varies by build)
+                        cand = [n for n in zf.namelist() if n.lower().endswith('/bin/ffmpeg.exe') or n.lower().endswith('ffmpeg.exe')]
+                        if not cand:
+                            # Extract all to temp and search
+                            with tempfile.TemporaryDirectory() as tmpd:
+                                zf.extractall(tmpd)
+                                for root, _dirs, files in os.walk(tmpd):
+                                    for f in files:
+                                        if f.lower() == 'ffmpeg.exe':
+                                            ffmpeg_exe_path = Path(root) / f
+                                            break
+                                    if ffmpeg_exe_path:
+                                        break
+                                if not ffmpeg_exe_path:
+                                    raise RuntimeError("ffmpeg.exe not found inside archive")
+                                # Copy to app_dir
+                                target = local_ffmpeg
+                                shutil.copy2(ffmpeg_exe_path, target)
+                                ffmpeg_exe_path = target
+                        else:
+                            # Directly extract ffmpeg.exe entry
+                            target = local_ffmpeg
+                            # If entry contains folders, extract then move
+                            member_name = cand[0]
+                            with zf.open(member_name) as src, open(target, 'wb') as out:
+                                shutil.copyfileobj(src, out)
+                            ffmpeg_exe_path = target
+                finally:
+                    try:
+                        dest_zip.unlink(missing_ok=True)  # cleanup zip
+                    except Exception:
+                        pass
+
+                if ffmpeg_exe_path and ffmpeg_exe_path.exists():
+                    try:
+                        os.chmod(ffmpeg_exe_path, 0o755)
+                    except Exception:
+                        pass
+                    self.ffmpeg_path = str(ffmpeg_exe_path)
+                    self.log.emit("[INFO] FFmpeg downloaded and ready")
+            except Exception as e:
+                self.log.emit(
+                    "[ERROR] Could not auto-download FFmpeg. Please place ffmpeg.exe next to the EXE or install FFmpeg in PATH."
+                )
+                self.log.emit(f"[DETAIL] {e}")
+        # Prefer local copy if available
+        if local_ffmpeg.exists():
+            self.ffmpeg_path = str(local_ffmpeg)
+
+    def preflight_rtmp(self) -> bool:
+        """Quickly validate RTMP endpoint by pushing a 1-second test stream.
+
+        Returns True on success; logs errors and returns False on failure.
+        """
+        try:
+            # Build minimal test command using color source (video) and anullsrc (audio)
+            gop = max(2, self.cfg.fps * 2)
+            vf_chain = [
+                "scale=-2:360:flags=bicubic",
+                f"format={self.cfg.pix_fmt}",
+            ]
+            def try_push(url: str) -> Tuple[bool, str]:
+                cmd = [
+                    self.ffmpeg_path or "ffmpeg",
+                    "-hide_banner", "-loglevel", "warning", "-stats",
+                    "-re", "-f", "lavfi", "-i", f"color=black:s=640x360:rate={self.cfg.fps}",
+                    "-f", "lavfi", "-i", "anullsrc=cl=stereo:r=44100",
+                    "-t", "1",
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", self.cfg.encoder, *(self.cfg.extra_venc_flags or []),
+                    "-fflags", "+genpts",
+                    "-r", str(self.cfg.fps), "-g", str(gop), "-keyint_min", str(gop),
+                    "-b:v", "1000k", "-maxrate", "1000k", "-bufsize", "2000k",
+                    "-vf", ",".join(vf_chain),
+                    "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2",
+                    "-f", "flv", url,
+                ]
+                try:
+                    cp = run_hidden(cmd, capture=True, timeout=15)
+                    return (cp.returncode == 0, (cp.stderr or "").strip())
+                except subprocess.TimeoutExpired:
+                    return (False, "RTMP preflight timed out")
+                except Exception as e:
+                    return (False, f"RTMP preflight exception: {e}")
+
+            self.log.emit("[INFO] Preflight: testing RTMP connectivity…")
+            url = self.cfg.rtmp_url()
+            ok, err = try_push(url)
+            if ok:
+                self.log.emit("[INFO] Preflight: RTMP OK")
+                return True
+
+            # Attempt RTMPS fallback if original was RTMP
+            try:
+                from urllib.parse import urlparse, urlunparse
+                u = urlparse(url)
+                if u.scheme == "rtmp":
+                    # Switch to rtmps and default to port 443 if none set or was 1935
+                    netloc = u.netloc
+                    host, sep, port = netloc.partition(":")
+                    new_port = "443"
+                    new_netloc = f"{host}:{new_port}" if host else netloc
+                    rtmps_url = urlunparse(("rtmps", new_netloc, u.path, u.params, u.query, u.fragment))
+                    self.log.emit("[INFO] Preflight: RTMP failed, trying RTMPS fallback…")
+                    ok2, err2 = try_push(rtmps_url)
+                    if ok2:
+                        self.log.emit("[INFO] Preflight: RTMPS OK")
+                        # Update cfg to use rtmps for the session
+                        self.cfg.rtmp_base = rtmps_url.rsplit("/", 1)[0]
+                        self.cfg.stream_key = rtmps_url.rsplit("/", 1)[-1]
+                        return True
+                    else:
+                        self.log.emit(f"[ERROR] RTMPS preflight failed: {err2}")
+            except Exception as e2:
+                self.log.emit(f"[WARN] RTMPS fallback error: {e2}")
+
+            self.log.emit(f"[ERROR] RTMP preflight failed: {err}")
+            return False
+        except Exception as e:
+            self.log.emit(f"[ERROR] RTMP preflight exception: {e}")
+            return False
 
     def _terminate_ff_proc(self) -> None:
         """Attempt to gracefully terminate any running ffmpeg process."""
@@ -336,10 +644,20 @@ class StreamWorker(QtCore.QObject):
             raise RuntimeError("yt-dlp.exe not found. Put it next to the EXE or in PATH.")
         
         self.log.emit(f"[INFO] Extracting playlist IDs from: {playlist_url}")
-        cmd = [self.ytdlp_path, "--ignore-errors", "--flat-playlist", "--get-id", playlist_url]
+        cmd = [self.ytdlp_path, "--ignore-errors", "--flat-playlist", "--get-id", *self._ytdlp_cookies_args(), playlist_url]
         cp = run_hidden(cmd)
         if cp.returncode != 0:
-            raise RuntimeError(f"yt-dlp error: {cp.stderr.strip()}")
+            err = (cp.stderr or "").strip()
+            # Common Windows chromium-family locking issue
+            if "Could not copy Chrome cookie database" in err:
+                fix = (
+                    "Browser cookie database is locked by a running Edge/Chrome instance.\n"
+                    "Close all Edge/Chrome windows (including background processes) and try again.\n\n"
+                    "Advanced: Launch your browser with --disable-features=LockProfileCookieDatabase to prevent locking.\n"
+                    "See: https://github.com/yt-dlp/yt-dlp/issues/7271"
+                )
+                raise RuntimeError(f"yt-dlp cookie error: {fix}")
+            raise RuntimeError(f"yt-dlp error: {err}")
         
         ids = [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
         self.log.emit(f"[INFO] Found {len(ids)} videos in playlist")
@@ -356,8 +674,10 @@ class StreamWorker(QtCore.QObject):
         if not self.ytdlp_path:
             return self.get_title_legacy(video_id), None
         url = f"https://www.youtube.com/watch?v={video_id}"
-        cp = run_hidden([self.ytdlp_path, "-j", url])
+        cp = run_hidden([self.ytdlp_path, "-j", *self._ytdlp_cookies_args(), url])
         if cp.returncode != 0 or not cp.stdout:
+            if cp.returncode != 0 and cp.stderr and "Could not copy Chrome cookie database" in cp.stderr:
+                self.log.emit("[WARN] Cookies locked by browser; close Edge/Chrome and retry (see issue #7271)")
             return self.get_title_legacy(video_id), None
         try:
             data = json.loads(cp.stdout.strip().splitlines()[-1])
@@ -372,7 +692,7 @@ class StreamWorker(QtCore.QObject):
         url = f"https://www.youtube.com/watch?v={video_id}"
         if not self.ytdlp_path:
             return url
-        cp = run_hidden([self.ytdlp_path, "--get-title", url])
+        cp = run_hidden([self.ytdlp_path, "--get-title", *self._ytdlp_cookies_args(), url])
         return (cp.stdout or "").strip() if cp.returncode == 0 and cp.stdout else url
 
     def get_stream_urls(self, video_id: str) -> Tuple[str, Optional[str]]:
@@ -380,6 +700,7 @@ class StreamWorker(QtCore.QObject):
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found.")
         url = f"https://www.youtube.com/watch?v={video_id}"
+        cookies = self._ytdlp_cookies_args()
         
         # Try multiple format strategies for better compatibility
         format_strategies = [
@@ -391,7 +712,7 @@ class StreamWorker(QtCore.QObject):
         
         for fmt in format_strategies:
             try:
-                cp = run_hidden([self.ytdlp_path, "-g", "-f", fmt, url])
+                cp = run_hidden([self.ytdlp_path, "-g", "-f", fmt, *cookies, url])
                 if cp.returncode == 0 and cp.stdout:
                     lines = [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
                     if lines:
@@ -401,7 +722,7 @@ class StreamWorker(QtCore.QObject):
                 
         # If all strategies fail, try without format specification
         try:
-            cp = run_hidden([self.ytdlp_path, "-g", url])
+            cp = run_hidden([self.ytdlp_path, "-g", *cookies, url])
             if cp.returncode == 0 and cp.stdout:
                 lines = [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
                 if lines:
@@ -450,8 +771,16 @@ class StreamWorker(QtCore.QObject):
         if self.cfg.overlay_titles:
             title_file = Path(self.cfg.title_file).as_posix().replace(":", r"\:").replace("'", r"\\'")
             fontsize = self.cfg._overlay_fontsize
+            fontfile = find_drawtext_fontfile()
+            if fontfile:
+                esc = fontfile.replace(":", r"\:").replace("'", r"\\'")
+                font_arg = f"fontfile='{esc}':"
+            else:
+                # Let ffmpeg pick a generic family via fontconfig if available
+                font_arg = "font='Sans':"
             vf.append(
-                f"drawtext=textfile='{title_file}':reload=1:"
+                f"drawtext=textfile='{title_file}':reload=1:" +
+                font_arg +
                 f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
             )
         vf.append(f"format={self.cfg.pix_fmt}")  # keep format as a separate filter
@@ -479,7 +808,16 @@ class StreamWorker(QtCore.QObject):
             "-b:v", self.cfg.video_bitrate, "-maxrate", self.cfg.video_bitrate, "-bufsize", self.cfg.bufsize,
             "-vf", vf_chain,
             "-c:a", "aac", "-b:a", self.cfg.audio_bitrate, "-ar", "44100", "-ac", "2",
-            "-f", "flv", self.cfg.rtmp_url()
+            # RTMP protocol options for better compatibility (e.g., Owncast)
+        ]
+
+        # Add RTMP-specific protocol options if enabled
+        out_url = self.cfg.rtmp_url()
+        if out_url.lower().startswith(("rtmp://", "rtmps://")) and self.cfg.rtmp_live:
+            cmd += ["-rtmp_live", "live", "-rtmp_tcurl", self.cfg.rtmp_base]
+
+        cmd += [
+            "-f", "flv", out_url
         ]
         return cmd
 
@@ -578,6 +916,12 @@ class StreamWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         """Main worker loop that continually streams the playlist."""
+        # Try to self-heal dependencies on Windows
+        try:
+            self.ensure_binaries()
+        except Exception:
+            pass
+
         if not self.ffmpeg_path:
             self.log.emit("[ERROR] ffmpeg not found. Put ffmpeg.exe next to the EXE or in PATH.")
             self.finished.emit()
@@ -588,6 +932,14 @@ class StreamWorker(QtCore.QObject):
             return
 
         self.select_encoder()
+        # Cookies/auth disabled
+        self.log.emit("[INFO] yt-dlp auth: none")
+
+        # Validate RTMP connectivity with a 1s preflight push
+        if not self.preflight_rtmp():
+            self.status.emit("Stopped")
+            self.finished.emit()
+            return
         self.status.emit("Starting…")
         self.log.emit(f"[INFO] Encoder: {self.cfg.encoder_name} ({self.cfg.encoder})")
         self.log.emit(f"[INFO] Playlist: {self.cfg.playlist_url}")
@@ -688,9 +1040,9 @@ class MainWindow(QtWidgets.QWidget):
         """Initialise all widgets and connect signals."""
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} — YouTube 24/7 VOD Streamer")
-        # Keep a sensible minimum width and let the height adjust dynamically.
-        self.setMinimumWidth(860)
-        self.resize(860, 680)
+        # Provide a sensible minimum size and allow resizing.
+        self.setMinimumSize(960, 480)
+        self.resize(1200, 700)
         self.worker_thread: Optional[QtCore.QThread] = None
         self.worker: Optional[StreamWorker] = None
         self.streaming = False
@@ -738,6 +1090,7 @@ class MainWindow(QtWidgets.QWidget):
         self.stop_btn.setEnabled(False)
         self.skip_btn = QtWidgets.QPushButton("Skip Video")
         self.skip_btn.setEnabled(False)
+        self.test_rtmp_btn = QtWidgets.QPushButton("Test RTMP")
 
         # --- Tabs ---
         tabs = QtWidgets.QTabWidget()
@@ -759,6 +1112,7 @@ class MainWindow(QtWidgets.QWidget):
         btns.addWidget(self.start_btn)
         btns.addWidget(self.stop_btn)
         btns.addWidget(self.skip_btn)
+        btns.addWidget(self.test_rtmp_btn)
         btns.addStretch(1)
         stream_layout.addLayout(btns)
         tabs.addTab(stream_tab, "Stream")
@@ -788,8 +1142,13 @@ class MainWindow(QtWidgets.QWidget):
         toggles.addWidget(self.overlay_chk)
         toggles.addWidget(self.shuffle_chk)
         toggles.addWidget(self.logfile_chk)
+        self.rtmp_live_chk = QtWidgets.QCheckBox("RTMP live mode (Owncast)")
+        self.rtmp_live_chk.setToolTip("Adds -rtmp_live live and tcurl for better compatibility with Owncast and some servers")
+        toggles.addWidget(self.rtmp_live_chk)
         toggles.addStretch(1)
         settings_layout.addLayout(toggles)
+
+    # (YouTube auth UI removed)
 
         bottom_opts = QtWidgets.QHBoxLayout()
         bottom_opts.addWidget(self.remember_chk)
@@ -819,6 +1178,10 @@ class MainWindow(QtWidgets.QWidget):
         self.check_update_btn = QtWidgets.QPushButton("Check for Updates")
         self.check_update_btn.clicked.connect(self.check_for_updates)
         update_controls_layout.addWidget(self.check_update_btn)
+        self.force_update_btn = QtWidgets.QPushButton("Force Update Binaries (yt-dlp & FFmpeg)")
+        self.force_update_btn.setToolTip("Re-download latest yt-dlp.exe and ffmpeg.exe next to the app")
+        self.force_update_btn.clicked.connect(self.on_force_update_binaries)
+        update_controls_layout.addWidget(self.force_update_btn)
         update_controls_layout.addStretch(1)
         
         # Update status label
@@ -854,6 +1217,7 @@ class MainWindow(QtWidgets.QWidget):
         self.start_btn.clicked.connect(self.on_start)
         self.stop_btn.clicked.connect(self.on_stop)
         self.skip_btn.clicked.connect(self.on_skip)
+        self.test_rtmp_btn.clicked.connect(self.on_test_rtmp)
         self.res_combo.currentIndexChanged.connect(self.on_quality_change)
         self.fps_combo.currentIndexChanged.connect(self.on_quality_change)
 
@@ -861,11 +1225,15 @@ class MainWindow(QtWidgets.QWidget):
         self.on_quality_change()
         self.load_settings()
 
+    # No auth mode toggles
+
         # persist as you tweak
         self.remember_chk.toggled.connect(lambda _: self.save_settings())
         self.overlay_chk.toggled.connect(lambda _: self.save_settings())
         self.shuffle_chk.toggled.connect(lambda _: self.save_settings())
         self.logfile_chk.toggled.connect(lambda _: self.save_settings())
+        if hasattr(self, "rtmp_live_chk"):
+            self.rtmp_live_chk.toggled.connect(lambda _: self.save_settings())
         self.check_updates_startup_chk.toggled.connect(lambda _: self.save_settings())
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.fps_combo.currentIndexChanged.connect(lambda _: self.save_settings())
@@ -876,6 +1244,45 @@ class MainWindow(QtWidgets.QWidget):
         # Check for updates on startup if enabled
         if self.check_updates_startup_chk.isChecked():
             QtCore.QTimer.singleShot(2000, self.check_for_updates_silent)
+
+    # (YouTube auth helpers removed)
+
+    # --- Force update binaries ---
+    def on_force_update_binaries(self):
+        if self.streaming:
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Stop streaming before updating binaries.")
+            return
+        self.force_update_btn.setEnabled(False)
+        self.append_log("[INFO] Forcing binaries update (yt-dlp, FFmpeg)…")
+
+        # Use a tiny one-off worker to reuse ensure_binaries with force=True
+        class _Updater(QtCore.QObject):
+            done = QtCore.Signal()
+            log = QtCore.Signal(str)
+            def run(self):
+                try:
+                    cfg = StreamConfig(playlist_url="", stream_key="")
+                    worker = StreamWorker(cfg)
+                    worker.log.connect(self.log)
+                    worker.ensure_binaries(force=True)
+                except Exception as e:
+                    self.log.emit(f"[ERROR] Force update failed: {e}")
+                finally:
+                    self.done.emit()
+
+        self._updater_thread = QtCore.QThread(self)
+        self._updater = _Updater()
+        self._updater.moveToThread(self._updater_thread)
+        self._updater_thread.started.connect(self._updater.run)
+        self._updater.log.connect(self.append_log)
+        self._updater.done.connect(self._updater_thread.quit)
+        def _finish():
+            self.force_update_btn.setEnabled(True)
+            self.append_log("[INFO] Binaries update finished.")
+            self._updater.deleteLater()
+            self._updater_thread.deleteLater()
+        self._updater_thread.finished.connect(_finish)
+        self._updater_thread.start()
 
     # --- settings (config.json) ---
     def load_settings(self):
@@ -893,6 +1300,11 @@ class MainWindow(QtWidgets.QWidget):
         self.shuffle_chk.setChecked(bool(cfg.get("shuffle", False)))
         self.logfile_chk.setChecked(bool(cfg.get("log_to_file", False)))
         self.check_updates_startup_chk.setChecked(bool(cfg.get("check_updates_startup", True)))
+        # RTMP live mode compatibility toggle
+        try:
+            self.rtmp_live_chk.setChecked(bool(cfg.get("rtmp_live", False)))
+        except Exception:
+            pass
 
         if "resolution" in cfg:
             idx = self.res_combo.findText(cfg["resolution"])
@@ -917,6 +1329,7 @@ class MainWindow(QtWidgets.QWidget):
             "overlay_titles": self.overlay_chk.isChecked(),
             "shuffle": self.shuffle_chk.isChecked(),
             "log_to_file": self.logfile_chk.isChecked(),
+            "rtmp_live": (self.rtmp_live_chk.isChecked() if hasattr(self, "rtmp_live_chk") and self.rtmp_live_chk is not None else False),
             "check_updates_startup": self.check_updates_startup_chk.isChecked(),
             "resolution": self.res_combo.currentText(),
             "framerate": int(self.fps_combo.currentText()),
@@ -981,6 +1394,7 @@ class MainWindow(QtWidgets.QWidget):
             overlay_titles=self.overlay_chk.isChecked(),
             shuffle=self.shuffle_chk.isChecked(),
             title_file="current_title.txt",
+            rtmp_live=(self.rtmp_live_chk.isChecked() if hasattr(self, "rtmp_live_chk") and self.rtmp_live_chk is not None else False),
         )
 
     # --- update checker ---
@@ -1206,6 +1620,53 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def on_test_rtmp(self):
+        """Run a 1-second RTMP preflight without starting the full stream."""
+        if self.streaming:
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Stop streaming to test RTMP.")
+            return
+        cfg = self.make_config()
+        if not cfg.rtmp_base or not cfg.stream_key:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "Please enter Stream URL and Stream Key to test RTMP.")
+            return
+        self.test_rtmp_btn.setEnabled(False)
+        self.append_log("[INFO] Testing RTMP connectivity…")
+
+        class _RTMPTester(QtCore.QObject):
+            done = QtCore.Signal(bool)
+            log = QtCore.Signal(str)
+            def __init__(self, cfg: StreamConfig):
+                super().__init__()
+                self.cfg = cfg
+            def run(self):
+                ok = False
+                try:
+                    worker = StreamWorker(self.cfg)
+                    worker.log.connect(self.log)
+                    worker.ensure_binaries()
+                    worker.select_encoder()
+                    ok = worker.preflight_rtmp()
+                except Exception as e:
+                    self.log.emit(f"[ERROR] RTMP test failed: {e}")
+                finally:
+                    self.done.emit(ok)
+
+        self._rtmp_thread = QtCore.QThread(self)
+        self._rtmp_worker = _RTMPTester(cfg)
+        self._rtmp_worker.moveToThread(self._rtmp_thread)
+        self._rtmp_thread.started.connect(self._rtmp_worker.run)
+        self._rtmp_worker.log.connect(self.append_log)
+        def _finish(ok: bool):
+            if ok:
+                self.append_log("[INFO] RTMP test succeeded.")
+            else:
+                self.append_log("[WARN] RTMP test failed. Check URL/port/app/key and TLS (rtmp vs rtmps).")
+            self.test_rtmp_btn.setEnabled(True)
+            self._rtmp_worker.deleteLater()
+            self._rtmp_thread.deleteLater()
+        self._rtmp_worker.done.connect(_finish)
+        self._rtmp_thread.start()
+
     def on_finished(self):
         """Cleanup once the worker thread stops."""
         self.append_log("[INFO] Worker finished.")
@@ -1248,7 +1709,6 @@ def main():
     app.setStyleSheet(DARK_QSS)
     w = MainWindow()
     w.setWindowIcon(icon)    # title-bar icon
-    w.setFixedSize(1280, 300)
     w.show()
     sys.exit(app.exec())
 
