@@ -30,7 +30,7 @@ if exist "dist\Stream247.exe" del "dist\Stream247.exe"
 
 echo.
 echo [3/4] Building executable...
-python -m PyInstaller --onefile --noconsole --icon=icon.ico --name=Stream247 --optimize=2 Stream247_GUI.py
+python -m PyInstaller --onefile --noconsole --icon=icon.ico --add-data "icon.ico;." --name=Stream247 --optimize=2 Stream247_GUI.py
 
 if not exist "dist\Stream247.exe" (
     echo ERROR: Build failed!
