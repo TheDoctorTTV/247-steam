@@ -18,7 +18,7 @@ import re
 
 # General application metadata and platform helpers
 APP_NAME = "Stream247"  # Name shown in the GUI and taskbar
-APP_VERSION = "1.3.1"  # Current version
+APP_VERSION = "1.3.2"  # Current version
 GITHUB_REPO = "TheDoctorTTV/247-steam"  # GitHub repository for updates
 IS_WIN = (os.name == "nt")  # True when running on Windows
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0  # Hide console windows
