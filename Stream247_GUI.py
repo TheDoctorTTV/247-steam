@@ -18,7 +18,7 @@ import re
 
 # General application metadata and platform helpers
 APP_NAME = "Stream247"  # Name shown in the GUI and taskbar
-APP_VERSION = "1.3"  # Current version
+APP_VERSION = "1.3.1"  # Current version
 GITHUB_REPO = "TheDoctorTTV/247-steam"  # GitHub repository for updates
 IS_WIN = (os.name == "nt")  # True when running on Windows
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0  # Hide console windows
@@ -229,23 +229,36 @@ def ffprobe_encoder(ffmpeg_path: str, codec: str) -> bool:
         return False
 
 def fmt_yt_date(upload_date: Optional[str], timestamp: Optional[int], release_ts: Optional[int]) -> Optional[str]:
-    """Return a human‑friendly YouTube upload date."""
+    """Return a human‑friendly YouTube upload date in UTC (matching YouTube's display)."""
     dt = None
     if upload_date and len(upload_date) == 8 and upload_date.isdigit():
         try:
-            dt = datetime.datetime.strptime(upload_date, "%Y%m%d")
+            # Parse the date string directly - upload_date is YYYYMMDD in UTC
+            year = int(upload_date[0:4])
+            month = int(upload_date[4:6])
+            day = int(upload_date[6:8])
+            date_obj = datetime.date(year, month, day)
+            # Subtract 1 day to account for timezone offset
+            date_obj = date_obj - datetime.timedelta(days=1)
+            # Format the corrected date
+            dt_for_format = datetime.datetime.combine(date_obj, datetime.time.min)
+            return dt_for_format.strftime("%b %#d, %Y") if IS_WIN else dt_for_format.strftime("%b %-d, %Y")
         except Exception:
-            dt = None
-    if dt is None:
-        ts = release_ts or timestamp
-        if ts:
-            try:
-                dt = datetime.datetime.fromtimestamp(int(ts))
-            except Exception:
-                dt = None
-    if dt is None:
-        return None
-    return dt.strftime("%b %#d, %Y") if IS_WIN else dt.strftime("%b %-d, %Y")
+            pass
+    # Fallback to timestamp if upload_date not available
+    ts = release_ts or timestamp
+    if ts:
+        try:
+            # Convert timestamp to UTC datetime
+            dt = datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone.utc)
+            # Subtract 1 day to account for timezone offset
+            dt = dt - datetime.timedelta(days=1)
+            # Strip timezone info for formatting
+            dt = dt.replace(tzinfo=None)
+            return dt.strftime("%b %#d, %Y") if IS_WIN else dt.strftime("%b %-d, %Y")
+        except Exception:
+            pass
+    return None
 
 
 # ---------- update checker ----------
@@ -696,13 +709,27 @@ class StreamWorker(QtCore.QObject):
         return (cp.stdout or "").strip() if cp.returncode == 0 and cp.stdout else url
 
     def get_stream_urls(self, video_id: str) -> Tuple[str, Optional[str]]:
-        """Return direct media URLs for a video (video and optional audio)."""
+        """Return media URLs for a video. Tries HLS first for stability, then falls back to direct URLs."""
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found.")
         url = f"https://www.youtube.com/watch?v={video_id}"
         cookies = self._ytdlp_cookies_args()
         
-        # Try multiple format strategies for better compatibility
+        # Strategy 1: Try HLS manifest (best for 24/7 streaming - no URL expiration)
+        try:
+            cp = run_hidden([self.ytdlp_path, "-g", "-f", "best", "--hls-prefer-native", *cookies, url])
+            if cp.returncode == 0 and cp.stdout:
+                lines = [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
+                # If we get an m3u8 URL, use it (single stream with muxed audio/video)
+                if lines and any('.m3u8' in line for line in lines):
+                    hls_url = next((line for line in lines if '.m3u8' in line), None)
+                    if hls_url:
+                        self.log.emit(f"[INFO] Using HLS manifest for {video_id} (stable for long streams)")
+                        return (hls_url, None)  # HLS contains both video and audio
+        except Exception as e:
+            self.log.emit(f"[DEBUG] HLS attempt failed: {e}")
+        
+        # Strategy 2: Try direct URLs with multiple format fallbacks (current method)
         format_strategies = [
             "bv*+ba/best",  # Best video + best audio (separate)
             "best[height<=?1080]",  # Best combined format up to 1080p
@@ -716,11 +743,14 @@ class StreamWorker(QtCore.QObject):
                 if cp.returncode == 0 and cp.stdout:
                     lines = [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
                     if lines:
-                        return (lines[0], None) if len(lines) == 1 else (lines[0], lines[1])
+                        # Skip if we got HLS URLs (we want direct URLs here)
+                        if not any('.m3u8' in line for line in lines):
+                            self.log.emit(f"[INFO] Using direct URLs for {video_id} (format: {fmt})")
+                            return (lines[0], None) if len(lines) == 1 else (lines[0], lines[1])
             except Exception:
                 continue
                 
-        # If all strategies fail, try without format specification
+        # Strategy 3: Final fallback - try without format specification
         try:
             cp = run_hidden([self.ytdlp_path, "-g", *cookies, url])
             if cp.returncode == 0 and cp.stdout:
@@ -786,11 +816,25 @@ class StreamWorker(QtCore.QObject):
         vf.append(f"format={self.cfg.pix_fmt}")  # keep format as a separate filter
         vf_chain = ",".join(vf)
 
+        # Detect if we're using HLS (m3u8) or direct URLs
+        is_hls = '.m3u8' in vurl.lower()
+        
         cmd = [
             self.ffmpeg_path or "ffmpeg",
             "-hide_banner", "-loglevel", "warning", "-stats",
-            "-re", "-i", vurl,
         ]
+        
+        # HLS-specific input options for better stability
+        if is_hls:
+            cmd += [
+                "-reconnect", "1",  # Auto-reconnect on connection loss
+                "-reconnect_streamed", "1",  # Reconnect for streamed protocols
+                "-reconnect_delay_max", "5",  # Max 5s delay between reconnects
+                "-live_start_index", "-3",  # Start from 3 segments before live edge
+            ]
+        
+        cmd += ["-re", "-i", vurl]
+        
         if aurl:
             cmd += ["-re", "-i", aurl]
 
@@ -798,7 +842,7 @@ class StreamWorker(QtCore.QObject):
         if aurl:
             maps += ["-map", "1:a:0"]
         else:
-            maps += ["-map", "0:a:0?"]  # optional audio if progressive
+            maps += ["-map", "0:a:0?"]  # optional audio if progressive/HLS
 
         cmd += [
             *maps,
@@ -808,7 +852,6 @@ class StreamWorker(QtCore.QObject):
             "-b:v", self.cfg.video_bitrate, "-maxrate", self.cfg.video_bitrate, "-bufsize", self.cfg.bufsize,
             "-vf", vf_chain,
             "-c:a", "aac", "-b:a", self.cfg.audio_bitrate, "-ar", "44100", "-ac", "2",
-            # RTMP protocol options for better compatibility (e.g., Owncast)
         ]
 
         # Add RTMP-specific protocol options if enabled
