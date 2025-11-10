@@ -350,6 +350,34 @@ class UpdateChecker(QtCore.QObject):
             return latest != current and latest > current
 
 
+# ---------- buffer presets ----------
+BUFFER_PRESETS = {
+    "Low": {
+        "probesize": "15M",
+        "analyzeduration": "5000000",  # 5 seconds
+        "buffer_size": "2048k",
+        "max_delay": "3000000",  # 3 seconds in microseconds
+    },
+    "Medium": {
+        "probesize": "25M",
+        "analyzeduration": "10000000",  # 10 seconds
+        "buffer_size": "4096k",
+        "max_delay": "7000000",  # 7 seconds in microseconds
+    },
+    "High": {
+        "probesize": "40M",
+        "analyzeduration": "15000000",  # 15 seconds
+        "buffer_size": "6144k",
+        "max_delay": "12000000",  # 12 seconds in microseconds
+    },
+    "Ultra": {
+        "probesize": "50M",
+        "analyzeduration": "30000000",  # 30 seconds
+        "buffer_size": "8192k",
+        "max_delay": "25000000",  # 25 seconds in microseconds
+    }
+}
+
 # ---------- streaming core ----------
 @dataclass
 class StreamConfig:
@@ -367,6 +395,7 @@ class StreamConfig:
     shuffle: bool = False
     title_file: str = "current_title.txt"
     rtmp_live: bool = False
+    buffer_mode: str = "Medium"  # Low, Medium, or High
 
     # runtime-selected
     encoder: str = "libx264"
@@ -398,6 +427,13 @@ class StreamWorker(QtCore.QObject):
         self.ffmpeg_path = find_ffmpeg()
         self.ytdlp_path = find_ytdlp()
         self.ff_proc = None
+        # Prefetch cache for next video
+        self._prefetch_video_id: Optional[str] = None
+        self._prefetch_title: Optional[str] = None
+        self._prefetch_date: Optional[str] = None
+        self._prefetch_vurl: Optional[str] = None
+        self._prefetch_aurl: Optional[str] = None
+        self._prefetch_thread: Optional[threading.Thread] = None
         # (YouTube auth config removed)
 
     def _ytdlp_cookies_args(self) -> List[str]:
@@ -762,6 +798,38 @@ class StreamWorker(QtCore.QObject):
             
         raise RuntimeError(f"No playable formats found for video {video_id}. This may be due to YouTube restrictions or an outdated yt-dlp version.")
 
+    def prefetch_next_video(self, video_id: str) -> None:
+        """Prefetch metadata and stream URLs for the next video in a background thread."""
+        def _fetch():
+            try:
+                self.log.emit(f"[PREFETCH] Loading next video: {video_id}")
+                title, date = self.get_metadata(video_id)
+                vurl, aurl = self.get_stream_urls(video_id)
+                
+                # Store in cache
+                self._prefetch_video_id = video_id
+                self._prefetch_title = title
+                self._prefetch_date = date
+                self._prefetch_vurl = vurl
+                self._prefetch_aurl = aurl
+                self.log.emit(f"[PREFETCH] Ready: {title}")
+            except Exception as e:
+                self.log.emit(f"[PREFETCH] Failed for {video_id}: {e}")
+                # Clear cache on error
+                self._prefetch_video_id = None
+                self._prefetch_title = None
+                self._prefetch_date = None
+                self._prefetch_vurl = None
+                self._prefetch_aurl = None
+        
+        # Start prefetch in background thread
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self.log.emit("[PREFETCH] Previous prefetch still running, skipping...")
+            return
+        
+        self._prefetch_thread = threading.Thread(target=_fetch, daemon=True)
+        self._prefetch_thread.start()
+
     # ---------- encoder selection ----------
     def select_encoder(self):
         """Choose the best available hardware encoder."""
@@ -819,9 +887,18 @@ class StreamWorker(QtCore.QObject):
         # Detect if we're using HLS (m3u8) or direct URLs
         is_hls = '.m3u8' in vurl.lower()
         
+        # Get buffer settings based on selected mode
+        buffer_settings = BUFFER_PRESETS.get(self.cfg.buffer_mode, BUFFER_PRESETS["Medium"])
+        
         cmd = [
             self.ffmpeg_path or "ffmpeg",
             "-hide_banner", "-loglevel", "warning", "-stats",
+        ]
+        
+        # Add buffer-related input options before input URL
+        cmd += [
+            "-probesize", buffer_settings["probesize"],
+            "-analyzeduration", buffer_settings["analyzeduration"],
         ]
         
         # HLS-specific input options for better stability
@@ -852,6 +929,9 @@ class StreamWorker(QtCore.QObject):
             "-b:v", self.cfg.video_bitrate, "-maxrate", self.cfg.video_bitrate, "-bufsize", self.cfg.bufsize,
             "-vf", vf_chain,
             "-c:a", "aac", "-b:a", self.cfg.audio_bitrate, "-ar", "44100", "-ac", "2",
+            # Add buffering for smoother streaming and handling network hiccups
+            "-max_delay", buffer_settings["max_delay"],
+            "-rtmp_buffer", buffer_settings["buffer_size"],
         ]
 
         # Add RTMP-specific protocol options if enabled
@@ -866,35 +946,48 @@ class StreamWorker(QtCore.QObject):
 
     def run_one_video(self, video_id: str):
         """Stream a single video using ffmpeg."""
-        try:
-            # Title + date overlay (truncate title; keep date intact)
-            title, pretty_date = self.get_metadata(video_id)
-            if self.cfg.overlay_titles:
-                suffix = f" • {pretty_date}" if pretty_date else ""
-                title_clean = (title or "").replace("\n", " ").strip()
+        # Check if this video was prefetched
+        if self._prefetch_video_id == video_id and self._prefetch_vurl:
+            self.log.emit(f"[PREFETCH] Using cached data for {video_id}")
+            title = self._prefetch_title
+            pretty_date = self._prefetch_date
+            vurl = self._prefetch_vurl
+            aurl = self._prefetch_aurl
+            # Clear prefetch cache after use
+            self._prefetch_video_id = None
+            self._prefetch_title = None
+            self._prefetch_date = None
+            self._prefetch_vurl = None
+            self._prefetch_aurl = None
+        else:
+            # Not prefetched, fetch normally
+            try:
+                title, pretty_date = self.get_metadata(video_id)
+                vurl, aurl = self.get_stream_urls(video_id)
+                self.log.emit(f"[INFO] Video URL obtained successfully for {video_id}")
+            except Exception as e:
+                self.log.emit(f"[ERROR] Failed to get video info for {video_id}: {e}")
+                # Try to check if video is available at all
+                url = f"https://www.youtube.com/watch?v={video_id}"
+                self.log.emit(f"[INFO] Video might be private, deleted, or region-restricted: {url}")
+                return  # Skip this video and continue
+        
+        # Title + date overlay (truncate title; keep date intact)
+        if self.cfg.overlay_titles:
+            suffix = f" • {pretty_date}" if pretty_date else ""
+            title_clean = (title or "").replace("\n", " ").strip()
 
-                MAX_LEN = 75  # total length including suffix
-                if len(title_clean) + len(suffix) > MAX_LEN:
-                    avail = max(10, MAX_LEN - len(suffix) - 3)  # leave room for "..."
-                    title_clean = title_clean[:avail] + "..."
+            MAX_LEN = 75  # total length including suffix
+            if len(title_clean) + len(suffix) > MAX_LEN:
+                avail = max(10, MAX_LEN - len(suffix) - 3)  # leave room for "..."
+                title_clean = title_clean[:avail] + "..."
 
-                overlay_text = title_clean + suffix
-                self.cfg._overlay_fontsize = 24
-                safe_write_text(Path(self.cfg.title_file), overlay_text)
-            else:
-                # Reset fontsize to default when overlay is disabled
-                self.cfg._overlay_fontsize = 24
-
-            # Direct URLs and ffmpeg run (hidden window, own process group)
-            vurl, aurl = self.get_stream_urls(video_id)
-            self.log.emit(f"[INFO] Video URL obtained successfully for {video_id}")
-            
-        except Exception as e:
-            self.log.emit(f"[ERROR] Failed to get video info for {video_id}: {e}")
-            # Try to check if video is available at all
-            url = f"https://www.youtube.com/watch?v={video_id}"
-            self.log.emit(f"[INFO] Video might be private, deleted, or region-restricted: {url}")
-            return  # Skip this video and continue
+            overlay_text = title_clean + suffix
+            self.cfg._overlay_fontsize = 24
+            safe_write_text(Path(self.cfg.title_file), overlay_text)
+        else:
+            # Reset fontsize to default when overlay is disabled
+            self.cfg._overlay_fontsize = 24
 
         ff_cmd = self.build_ffmpeg_cmd(vurl, aurl)
         self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
@@ -953,6 +1046,11 @@ class StreamWorker(QtCore.QObject):
                             self.log.emit(line.rstrip())
                     stream.close()
             self.ff_proc = None
+        
+        # CRITICAL: Wait for RTMP connection to fully close before starting next video
+        # Without this delay, the RTMP server rejects the new connection (only 1 connection per key allowed)
+        if not self._stop.is_set():
+            time.sleep(2)
 
 
     # ---------- main loop ----------
@@ -1013,6 +1111,11 @@ class StreamWorker(QtCore.QObject):
                     self.log.emit(f"[INFO] Item #{idx} - https://www.youtube.com/watch?v={vid}")
                     self.log.emit("-" * 46)
 
+                    # Prefetch the next video in the background (if available)
+                    if idx < len(ids):
+                        next_vid = ids[idx]  # idx is 1-based, so ids[idx] is the next video
+                        self.prefetch_next_video(next_vid)
+
                     try:
                         self.run_one_video(vid)
                     except Exception as e:
@@ -1061,6 +1164,10 @@ QCheckBox::indicator:checked {
 }
 QCheckBox::indicator:unchecked {
   background: #1a1d21; image: none;
+}
+
+QToolTip {
+  background: #1a1d21; color: #e6e6e6; border: 1px solid #2a2f36; padding: 4px;
 }
 """
 
@@ -1111,6 +1218,11 @@ class MainWindow(QtWidgets.QWidget):
         self.fps_combo = QtWidgets.QComboBox()
         self.fps_combo.addItems(["30", "60"])
         self.fps_combo.setCurrentText("30")
+        
+        self.buffer_combo = QtWidgets.QComboBox()
+        self.buffer_combo.addItems(["Low", "Medium", "High", "Ultra"])
+        self.buffer_combo.setCurrentText("Medium")
+        self.buffer_combo.setToolTip("Buffering helps smooth out network hiccups.\nLow: 3s, Medium: 7s (default), High: 12s, Ultra: 25s")
         
         self.bitrate_edit = QtWidgets.QLineEdit("2300k")
         self.bufsize_edit = QtWidgets.QLineEdit("4600k")
@@ -1179,6 +1291,8 @@ class MainWindow(QtWidgets.QWidget):
         settings_form.addWidget(self.bitrate_edit, 1, 1)
         settings_form.addWidget(QtWidgets.QLabel("Buffer Size"), 1, 2)
         settings_form.addWidget(self.bufsize_edit, 1, 3)
+        settings_form.addWidget(QtWidgets.QLabel("Stream Buffer"), 2, 0)
+        settings_form.addWidget(self.buffer_combo, 2, 1)
         settings_layout.addLayout(settings_form)
 
         toggles = QtWidgets.QHBoxLayout()
@@ -1280,6 +1394,7 @@ class MainWindow(QtWidgets.QWidget):
         self.check_updates_startup_chk.toggled.connect(lambda _: self.save_settings())
         self.res_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.fps_combo.currentIndexChanged.connect(lambda _: self.save_settings())
+        self.buffer_combo.currentIndexChanged.connect(lambda _: self.save_settings())
         self.bitrate_edit.textChanged.connect(lambda _: self.save_settings())
         self.bufsize_edit.textChanged.connect(lambda _: self.save_settings())
         self.rtmp_edit.textChanged.connect(lambda _: self.save_settings())
@@ -1358,6 +1473,11 @@ class MainWindow(QtWidgets.QWidget):
             idx = self.fps_combo.findText(str(cfg["framerate"]))
             if idx >= 0:
                 self.fps_combo.setCurrentIndex(idx)
+        
+        if "buffer_mode" in cfg:
+            idx = self.buffer_combo.findText(cfg["buffer_mode"])
+            if idx >= 0:
+                self.buffer_combo.setCurrentIndex(idx)
                 
         if "video_bitrate" in cfg:
             self.bitrate_edit.setText(cfg["video_bitrate"])
@@ -1376,6 +1496,7 @@ class MainWindow(QtWidgets.QWidget):
             "check_updates_startup": self.check_updates_startup_chk.isChecked(),
             "resolution": self.res_combo.currentText(),
             "framerate": int(self.fps_combo.currentText()),
+            "buffer_mode": self.buffer_combo.currentText(),
             "video_bitrate": self.bitrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
         })
@@ -1438,6 +1559,7 @@ class MainWindow(QtWidgets.QWidget):
             shuffle=self.shuffle_chk.isChecked(),
             title_file="current_title.txt",
             rtmp_live=(self.rtmp_live_chk.isChecked() if hasattr(self, "rtmp_live_chk") and self.rtmp_live_chk is not None else False),
+            buffer_mode=self.buffer_combo.currentText(),
         )
 
     # --- update checker ---
