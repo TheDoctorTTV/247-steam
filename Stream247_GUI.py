@@ -18,7 +18,7 @@ import re
 
 # General application metadata and platform helpers
 APP_NAME = "Stream247"  # Name shown in the GUI and taskbar
-APP_VERSION = "1.3.2"  # Current version
+APP_VERSION = "1.4"  # Current version
 GITHUB_REPO = "TheDoctorTTV/247-steam"  # GitHub repository for updates
 IS_WIN = (os.name == "nt")  # True when running on Windows
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0  # Hide console windows
@@ -214,6 +214,35 @@ def safe_write_text(path: Path, text: str) -> None:
         path.write_text(text, encoding="utf-8", errors="ignore")
     except Exception:
         pass
+
+def detect_input_type(url: str) -> str:
+    """Detect the type of input URL.
+    
+    Returns:
+        'youtube_playlist' - YouTube playlist URL
+        'youtube_video' - Single YouTube video URL
+        'twitch_stream' - Twitch channel/stream URL
+        'direct_hls' - Direct HLS manifest URL (.m3u8)
+        'unknown' - Unrecognized format
+    """
+    url_lower = url.lower().strip()
+    
+    # YouTube playlist detection
+    if 'youtube.com' in url_lower or 'youtu.be' in url_lower:
+        if 'list=' in url_lower:
+            return 'youtube_playlist'
+        elif 'watch?v=' in url_lower or 'youtu.be/' in url_lower:
+            return 'youtube_video'
+    
+    # Direct HLS manifest (m3u8 extension)
+    if url_lower.endswith('.m3u8'):
+        return 'direct_hls'
+    
+    # Twitch channel/stream URL
+    if 'twitch.tv' in url_lower:
+        return 'twitch_stream'
+    
+    return 'unknown'
 
 def ffprobe_encoder(ffmpeg_path: str, codec: str) -> bool:
     """Check whether ``ffmpeg`` can use a specific encoder."""
@@ -687,36 +716,61 @@ class StreamWorker(QtCore.QObject):
         self.ff_proc = None
 
     # ---------- yt-dlp helpers ----------
-    def get_video_ids(self, playlist_url: str) -> List[str]:
-        """Return a list of video IDs contained in a YouTube playlist."""
+    def get_video_ids(self, url: str) -> List[str]:
+        """Return a list of video IDs from a YouTube playlist or single video URL."""
         if not self.ytdlp_path:
             raise RuntimeError("yt-dlp.exe not found. Put it next to the EXE or in PATH.")
         
-        self.log.emit(f"[INFO] Extracting playlist IDs from: {playlist_url}")
-        cmd = [self.ytdlp_path, "--ignore-errors", "--flat-playlist", "--get-id", *self._ytdlp_cookies_args(), playlist_url]
-        cp = run_hidden(cmd)
-        if cp.returncode != 0:
-            err = (cp.stderr or "").strip()
-            # Common Windows chromium-family locking issue
-            if "Could not copy Chrome cookie database" in err:
-                fix = (
-                    "Browser cookie database is locked by a running Edge/Chrome instance.\n"
-                    "Close all Edge/Chrome windows (including background processes) and try again.\n\n"
-                    "Advanced: Launch your browser with --disable-features=LockProfileCookieDatabase to prevent locking.\n"
-                    "See: https://github.com/yt-dlp/yt-dlp/issues/7271"
-                )
-                raise RuntimeError(f"yt-dlp cookie error: {fix}")
-            raise RuntimeError(f"yt-dlp error: {err}")
+        input_type = detect_input_type(url)
         
-        ids = [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
-        self.log.emit(f"[INFO] Found {len(ids)} videos in playlist")
-        
-        if len(ids) > 10:
-            self.log.emit(f"[INFO] First 10 video IDs: {ids[:10]}")
-        else:
-            self.log.emit(f"[INFO] Video IDs: {ids}")
+        if input_type == 'youtube_video':
+            # Single video - extract video ID directly
+            self.log.emit(f"[INFO] Detected single YouTube video: {url}")
+            cmd = [self.ytdlp_path, "--ignore-errors", "--get-id", *self._ytdlp_cookies_args(), url]
+            cp = run_hidden(cmd)
+            if cp.returncode != 0:
+                err = (cp.stderr or "").strip()
+                if "Could not copy Chrome cookie database" in err:
+                    self.log.emit("[WARN] Chrome cookie database locked. Single video will still work without auth.")
+                raise RuntimeError(f"yt-dlp error: {err}")
             
-        return ids
+            video_id = (cp.stdout or "").strip()
+            if video_id:
+                self.log.emit(f"[INFO] Video ID: {video_id}")
+                return [video_id]
+            else:
+                raise RuntimeError("Could not extract video ID")
+        
+        elif input_type == 'youtube_playlist':
+            # Playlist - extract all video IDs
+            self.log.emit(f"[INFO] Extracting playlist IDs from: {url}")
+            cmd = [self.ytdlp_path, "--ignore-errors", "--flat-playlist", "--get-id", *self._ytdlp_cookies_args(), url]
+            cp = run_hidden(cmd)
+            if cp.returncode != 0:
+                err = (cp.stderr or "").strip()
+                # Common Windows chromium-family locking issue
+                if "Could not copy Chrome cookie database" in err:
+                    fix = (
+                        "Browser cookie database is locked by a running Edge/Chrome instance.\n"
+                        "Close all Edge/Chrome windows (including background processes) and try again.\n\n"
+                        "Advanced: Launch your browser with --disable-features=LockProfileCookieDatabase to prevent locking.\n"
+                        "See: https://github.com/yt-dlp/yt-dlp/issues/7271"
+                    )
+                    raise RuntimeError(f"yt-dlp cookie error: {fix}")
+                raise RuntimeError(f"yt-dlp error: {err}")
+            
+            ids = [line.strip() for line in (cp.stdout or "").splitlines() if line.strip()]
+            self.log.emit(f"[INFO] Found {len(ids)} videos in playlist")
+            
+            if len(ids) > 10:
+                self.log.emit(f"[INFO] First 10 video IDs: {ids[:10]}")
+            else:
+                self.log.emit(f"[INFO] Video IDs: {ids}")
+                
+            return ids
+        
+        else:
+            raise RuntimeError(f"Unsupported URL type for video ID extraction: {input_type}")
 
     def get_metadata(self, video_id: str) -> Tuple[str, Optional[str]]:
         """Fetch the title and upload date for a video."""
@@ -743,6 +797,28 @@ class StreamWorker(QtCore.QObject):
             return url
         cp = run_hidden([self.ytdlp_path, "--get-title", *self._ytdlp_cookies_args(), url])
         return (cp.stdout or "").strip() if cp.returncode == 0 and cp.stdout else url
+
+    def get_twitch_hls_url(self, twitch_url: str) -> str:
+        """Extract the HLS manifest URL from a Twitch channel/stream URL using yt-dlp."""
+        if not self.ytdlp_path:
+            raise RuntimeError("yt-dlp.exe not found.")
+        
+        self.log.emit(f"[INFO] Extracting Twitch HLS URL from: {twitch_url}")
+        
+        # Use yt-dlp to get the best quality stream URL
+        cmd = [self.ytdlp_path, "-f", "best", "-g", twitch_url]
+        cp = run_hidden(cmd)
+        
+        if cp.returncode != 0:
+            err = (cp.stderr or "").strip()
+            raise RuntimeError(f"Failed to extract Twitch stream URL: {err}")
+        
+        hls_url = (cp.stdout or "").strip()
+        if not hls_url:
+            raise RuntimeError("No HLS URL returned from yt-dlp for Twitch stream")
+        
+        self.log.emit(f"[INFO] Twitch HLS URL obtained: {hls_url[:80]}...")
+        return hls_url
 
     def get_stream_urls(self, video_id: str) -> Tuple[str, Optional[str]]:
         """Return media URLs for a video. Tries HLS first for stability, then falls back to direct URLs."""
@@ -944,6 +1020,106 @@ class StreamWorker(QtCore.QObject):
         ]
         return cmd
 
+    def run_twitch_stream(self, source_url: str):
+        """Stream a Twitch stream continuously using ffmpeg.
+        
+        Args:
+            source_url: Either a direct HLS .m3u8 URL or a Twitch channel URL
+        """
+        # Extract channel name from URL for overlay
+        title = "Twitch Live Stream"
+        
+        # Try to extract channel name from URL
+        if 'twitch.tv/' in source_url.lower():
+            # Parse channel name from URL (e.g., https://www.twitch.tv/channelname)
+            parts = source_url.rstrip('/').split('/')
+            if parts:
+                channel_name = parts[-1]
+                # Remove any query parameters
+                if '?' in channel_name:
+                    channel_name = channel_name.split('?')[0]
+                if channel_name and channel_name.lower() not in ('twitch.tv', 'www.twitch.tv'):
+                    title = f"Twitch • {channel_name}"
+        
+        # Determine if we need to extract the HLS URL
+        input_type = detect_input_type(source_url)
+        
+        if input_type == 'twitch_stream':
+            # Extract HLS URL from Twitch channel using yt-dlp
+            try:
+                vurl = self.get_twitch_hls_url(source_url)
+            except Exception as e:
+                raise RuntimeError(f"Failed to get Twitch stream URL: {e}")
+        elif input_type == 'direct_hls':
+            # Already a direct HLS URL
+            vurl = source_url
+        else:
+            raise RuntimeError(f"Invalid Twitch stream URL type: {input_type}")
+        
+        aurl = None  # Audio is included in the HLS stream
+        
+        # Title overlay for Twitch
+        if self.cfg.overlay_titles:
+            overlay_text = title
+            self.cfg._overlay_fontsize = 24
+            safe_write_text(Path(self.cfg.title_file), overlay_text)
+        
+        ff_cmd = self.build_ffmpeg_cmd(vurl, aurl)
+        self.log.emit(f"[CMD] ffmpeg: {' '.join(ff_cmd)}")
+        self._skip.clear()
+        self.ff_proc = subprocess.Popen(
+            ff_cmd,
+            stdin=None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            startupinfo=STARTUPINFO,
+            creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        )
+
+        def _reader(stream):
+            for line in iter(stream.readline, ""):
+                self.log.emit(line.rstrip())
+
+        readers = []
+        if self.ff_proc.stdout:
+            t = threading.Thread(target=_reader, args=(self.ff_proc.stdout,))
+            t.daemon = True
+            t.start()
+            readers.append(t)
+        if self.ff_proc.stderr:
+            t = threading.Thread(target=_reader, args=(self.ff_proc.stderr,))
+            t.daemon = True
+            t.start()
+            readers.append(t)
+
+        # Wait until ffmpeg finishes or a stop is requested
+        while self.ff_proc and self.ff_proc.poll() is None and not self._stop.is_set():
+            time.sleep(0.2)
+        
+        if self._stop.is_set():
+            self._terminate_ff_proc()
+        else:
+            try:
+                self.ff_proc.wait(timeout=2.0)
+            except Exception:
+                self._terminate_ff_proc()
+
+        for t in readers:
+            t.join(timeout=0.2)
+
+        # Ensure any buffered ffmpeg output is flushed after the process exits
+        if self.ff_proc:
+            for stream in (self.ff_proc.stdout, self.ff_proc.stderr):
+                if stream:
+                    leftover = stream.read()
+                    if leftover:
+                        for line in leftover.splitlines():
+                            self.log.emit(line.rstrip())
+                    stream.close()
+            self.ff_proc = None
+
     def run_one_video(self, video_id: str):
         """Stream a single video using ffmpeg."""
         # Check if this video was prefetched
@@ -1083,61 +1259,87 @@ class StreamWorker(QtCore.QObject):
             return
         self.status.emit("Starting…")
         self.log.emit(f"[INFO] Encoder: {self.cfg.encoder_name} ({self.cfg.encoder})")
-        self.log.emit(f"[INFO] Playlist: {self.cfg.playlist_url}")
+        self.log.emit(f"[INFO] Source:   {self.cfg.playlist_url}")
         self.log.emit(f"[INFO] RTMP:     {self.cfg.rtmp_url()}")
         self.log.emit(
             f"[INFO] Output:   {self.cfg.height}p@{self.cfg.fps}  ~{self.cfg.video_bitrate} video + {self.cfg.audio_bitrate} audio\n"
         )
 
-        while not self._stop.is_set():
-            try:
-                ids = self.get_video_ids(self.cfg.playlist_url)
-                if not ids:
-                    self.log.emit("[WARN] No IDs found; retrying in 30s…")
+        # Detect input type
+        input_type = detect_input_type(self.cfg.playlist_url)
+        
+        if input_type in ('twitch_stream', 'direct_hls'):
+            # Twitch stream or direct HLS - continuous streaming
+            stream_type_name = "Twitch stream" if input_type == 'twitch_stream' else "HLS stream"
+            self.log.emit(f"[INFO] Detected {stream_type_name} - streaming continuously...")
+            while not self._stop.is_set():
+                try:
+                    self.run_twitch_stream(self.cfg.playlist_url)
+                    if not self._stop.is_set():
+                        self.log.emit(f"[WARN] {stream_type_name} ended unexpectedly. Reconnecting in 5s...")
+                        for _ in range(5):
+                            if self._stop.is_set():
+                                break
+                            time.sleep(1)
+                except Exception as e:
+                    self.log.emit(f"[ERROR] {stream_type_name} error: {e}")
+                    if not self._stop.is_set():
+                        self.log.emit("[INFO] Retrying in 10s...")
+                        for _ in range(10):
+                            if self._stop.is_set():
+                                break
+                            time.sleep(1)
+        else:
+            # YouTube playlist or video - loop through videos
+            while not self._stop.is_set():
+                try:
+                    ids = self.get_video_ids(self.cfg.playlist_url)
+                    if not ids:
+                        self.log.emit("[WARN] No IDs found; retrying in 30s…")
+                        for _ in range(30):
+                            if self._stop.is_set():
+                                break
+                            time.sleep(1)
+                        continue
+
+                    if self.cfg.shuffle:
+                        random.shuffle(ids)
+
+                    for idx, vid in enumerate(ids, 1):
+                        if self._stop.is_set():
+                            break
+
+                        self.log.emit("-" * 46)
+                        self.log.emit(f"[INFO] Item #{idx} - https://www.youtube.com/watch?v={vid}")
+                        self.log.emit("-" * 46)
+
+                        # Prefetch the next video in the background (if available)
+                        if idx < len(ids):
+                            next_vid = ids[idx]  # idx is 1-based, so ids[idx] is the next video
+                            self.prefetch_next_video(next_vid)
+
+                        try:
+                            self.run_one_video(vid)
+                        except Exception as e:
+                            self.log.emit(f"[WARN] Stream error for video {vid}: {e}")
+                            self.log.emit("[INFO] Continuing to next video...")
+                            # Add a small delay before trying the next video
+                            if not self._stop.is_set():
+                                time.sleep(2)
+
+                        if self._stop.is_set():
+                            break
+
+                    if self._stop.is_set():
+                        break
+                    self.log.emit("\n[INFO] End of playlist. Refreshing IDs and looping…\n")
+
+                except Exception as e:
+                    self.log.emit(f"[WARN] Loop error: {e}. Retrying in 30s…")
                     for _ in range(30):
                         if self._stop.is_set():
                             break
                         time.sleep(1)
-                    continue
-
-                if self.cfg.shuffle:
-                    random.shuffle(ids)
-
-                for idx, vid in enumerate(ids, 1):
-                    if self._stop.is_set():
-                        break
-
-                    self.log.emit("-" * 46)
-                    self.log.emit(f"[INFO] Item #{idx} - https://www.youtube.com/watch?v={vid}")
-                    self.log.emit("-" * 46)
-
-                    # Prefetch the next video in the background (if available)
-                    if idx < len(ids):
-                        next_vid = ids[idx]  # idx is 1-based, so ids[idx] is the next video
-                        self.prefetch_next_video(next_vid)
-
-                    try:
-                        self.run_one_video(vid)
-                    except Exception as e:
-                        self.log.emit(f"[WARN] Stream error for video {vid}: {e}")
-                        self.log.emit("[INFO] Continuing to next video...")
-                        # Add a small delay before trying the next video
-                        if not self._stop.is_set():
-                            time.sleep(2)
-
-                    if self._stop.is_set():
-                        break
-
-                if self._stop.is_set():
-                    break
-                self.log.emit("\n[INFO] End of playlist. Refreshing IDs and looping…\n")
-
-            except Exception as e:
-                self.log.emit(f"[WARN] Loop error: {e}. Retrying in 30s…")
-                for _ in range(30):
-                    if self._stop.is_set():
-                        break
-                    time.sleep(1)
 
         self.status.emit("Stopped")
         self.finished.emit()
@@ -1204,7 +1406,8 @@ class MainWindow(QtWidgets.QWidget):
 
         # Inputs
         self.playlist_edit = QtWidgets.QLineEdit("")
-        self.playlist_edit.setPlaceholderText("Your YouTube playlist URL…")
+        self.playlist_edit.setPlaceholderText("YouTube playlist/video URL or Twitch stream URL…")
+        self.playlist_edit.setToolTip("Supports:\n• YouTube playlists (list=...)\n• YouTube videos (watch?v=...)\n• Twitch channels (twitch.tv/username)\n• Direct HLS streams (.m3u8 URLs)")
         self.rtmp_edit = QtWidgets.QLineEdit("rtmp://a.rtmp.youtube.com/live2")
         self.rtmp_edit.setPlaceholderText("RTMP ingest URL (e.g., rtmp://a.rtmp.youtube.com/live2)")
         self.key_edit = QtWidgets.QLineEdit("")
@@ -1230,6 +1433,7 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay_chk = QtWidgets.QCheckBox("Overlay current VOD title")
         self.overlay_chk.setChecked(True)
         self.shuffle_chk = QtWidgets.QCheckBox("Shuffle playlist order")
+        self.shuffle_chk.setToolTip("Only applies to YouTube playlists")
         self.logfile_chk = QtWidgets.QCheckBox("Log to file")
         self.remember_chk = QtWidgets.QCheckBox("Save playlist and key")
         self.remember_chk.setChecked(True)
@@ -1255,7 +1459,7 @@ class MainWindow(QtWidgets.QWidget):
         stream_layout = QtWidgets.QVBoxLayout(stream_tab)
 
         stream_form = QtWidgets.QGridLayout()
-        stream_form.addWidget(QtWidgets.QLabel("Playlist URL"), 0, 0)
+        stream_form.addWidget(QtWidgets.QLabel("Source URL"), 0, 0)
         stream_form.addWidget(self.playlist_edit, 0, 1, 1, 3)
         stream_form.addWidget(QtWidgets.QLabel("Stream URL"), 1, 0)
         stream_form.addWidget(self.rtmp_edit, 1, 1, 1, 3)
@@ -1713,7 +1917,7 @@ class MainWindow(QtWidgets.QWidget):
             return
         cfg = self.make_config()
         if not cfg.playlist_url or not cfg.rtmp_base or not cfg.stream_key:
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "Please enter Playlist URL, Stream URL, and Stream Key.")
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "Please enter Source URL, Stream URL, and Stream Key.")
             return
 
         # save settings right when starting (if 'remember' is checked)
