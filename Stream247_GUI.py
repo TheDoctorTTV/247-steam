@@ -1,5 +1,5 @@
 # Stream247_GUI.py — GUI YouTube 24/7 streamer
-# - Uses yt-dlp.exe (next to the EXE) for playlist IDs / titles / direct URLs
+# - Uses yt-dlp (next to the app) for playlist IDs / titles / direct URLs
 # - Auto-selects NVENC > QSV > AMF > x264 via safe probe
 # - Runs ffmpeg and yt-dlp with hidden windows (no console)
 # - Clean Start/Stop (kills ffmpeg reliably; Windows fallback uses taskkill /T /F)
@@ -7,7 +7,7 @@
 # - Overlay shows: "<TITLE> • <Pretty Date>" with title truncation (date preserved)
 
 import os, sys, time, json, random, shutil, subprocess, threading, datetime, webbrowser
-import zipfile, tempfile
+import zipfile, tempfile, platform, tarfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from pathlib import Path
@@ -18,7 +18,7 @@ import re
 
 # General application metadata and platform helpers
 APP_NAME = "Stream247"  # Name shown in the GUI and taskbar
-APP_VERSION = "1.4"  # Current version
+APP_VERSION = "1.5"  # Current version
 GITHUB_REPO = "TheDoctorTTV/247-steam"  # GitHub repository for updates
 IS_WIN = (os.name == "nt")  # True when running on Windows
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0  # Hide console windows
@@ -34,6 +34,11 @@ if IS_WIN:
 # ---------- config.json helpers ----------
 def _app_dir() -> Path:
     """Return the directory where the app is running from."""
+    # If running from AppImage, use a writable config path.
+    appimage = os.environ.get("APPIMAGE")
+    if appimage:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        return base / APP_NAME
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys.executable).parent  # packaged exe folder
     return Path.cwd()                       # running from source
@@ -140,6 +145,8 @@ def _download_url(url: str, dest_path: Path, user_agent: Optional[str] = None) -
 
     Uses a temp file then renames into place to avoid partial files on failure.
     """
+    # Ensure parent exists before creating a temp file in that directory.
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
     headers = {}
     if user_agent:
         headers["User-Agent"] = user_agent
@@ -154,8 +161,6 @@ def _download_url(url: str, dest_path: Path, user_agent: Optional[str] = None) -
                     break
                 tf.write(chunk)
             tmp_name = tf.name
-    # Ensure parent exists
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
     # Replace existing file if present
     Path(tmp_name).replace(dest_path)
 
@@ -244,15 +249,29 @@ def detect_input_type(url: str) -> str:
     
     return 'unknown'
 
-def ffprobe_encoder(ffmpeg_path: str, codec: str) -> bool:
+def ffprobe_encoder(ffmpeg_path: Optional[str], codec: str) -> bool:
     """Check whether ``ffmpeg`` can use a specific encoder."""
+    if not ffmpeg_path:
+        return False
     try:
         null = "NUL" if IS_WIN else "/dev/null"
-        cmd = [
-            ffmpeg_path, "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", "color=black:s=320x180:rate=30",
-            "-t", "0.2", "-c:v", codec, "-f", "null", null
-        ]
+        if codec == "h264_vaapi":
+            device = "/dev/dri/renderD128"
+            if not Path(device).exists():
+                return False
+            cmd = [
+                ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                "-vaapi_device", device,
+                "-f", "lavfi", "-i", "color=black:s=320x180:rate=30",
+                "-t", "0.2", "-vf", "format=nv12,hwupload",
+                "-c:v", codec, "-f", "null", null
+            ]
+        else:
+            cmd = [
+                ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=black:s=320x180:rate=30",
+                "-t", "0.2", "-c:v", codec, "-f", "null", null
+            ]
         return run_hidden(cmd).returncode == 0
     except Exception:
         return False
@@ -465,47 +484,85 @@ class StreamWorker(QtCore.QObject):
         self._prefetch_thread: Optional[threading.Thread] = None
         # (YouTube auth config removed)
 
+    def _maybe_switch_to_system_ffmpeg(self, reason: str) -> bool:
+        """Switch to PATH ffmpeg on non-Windows when the bundled binary misbehaves."""
+        if IS_WIN:
+            return False
+        system_ffmpeg = shutil.which("ffmpeg")
+        if not system_ffmpeg:
+            return False
+        try:
+            if self.ffmpeg_path and Path(self.ffmpeg_path).resolve() == Path(system_ffmpeg).resolve():
+                return False
+        except Exception:
+            pass
+        self.log.emit(f"[WARN] {reason}. Switching to system ffmpeg: {system_ffmpeg}")
+        self.ffmpeg_path = system_ffmpeg
+        return True
+
     def _ytdlp_cookies_args(self) -> List[str]:
         """Return yt-dlp auth arguments. Cookies disabled (no auth needed)."""
         return []
 
     # ---------- dependency ensure / auto-download ----------
     def ensure_binaries(self, force: bool = False):
-        """Ensure yt-dlp and ffmpeg are available; try to auto-download on Windows.
+        """Ensure yt-dlp and ffmpeg are available; auto-download per OS when missing."""
+        app_dir = _app_dir()
+        sys_name = platform.system().lower()
+        machine = platform.machine().lower()
 
-        - yt-dlp: download latest Windows exe from GitHub if missing
-        - ffmpeg: download prebuilt gyan.dev latest zip if missing and extract ffmpeg.exe
-        """
-        if not IS_WIN:
-            # On non-Windows, we don't attempt auto-install; rely on PATH.
+        if sys_name == "windows":
+            ytdlp_url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+            ytdlp_regex = r"yt-dlp.*\.exe$"
+            ytdlp_local_name = "yt-dlp.exe"
+            ffmpeg_local_name = "ffmpeg.exe"
+        elif sys_name == "linux":
+            ytdlp_url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
+            ytdlp_regex = r"yt-dlp_linux$"
+            ytdlp_local_name = "yt-dlp"
+            ffmpeg_local_name = "ffmpeg"
+        elif sys_name == "darwin":
+            ytdlp_url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
+            ytdlp_regex = r"yt-dlp_macos$"
+            ytdlp_local_name = "yt-dlp"
+            ffmpeg_local_name = "ffmpeg"
+        else:
+            self.log.emit(f"[WARN] Unsupported OS for auto-download: {platform.system()}")
             return
 
-        app_dir = _app_dir()
+        # Prefer system binaries on non-Windows unless forced.
+        if not IS_WIN and not force:
+            sys_ytdlp = shutil.which("yt-dlp")
+            sys_ffmpeg = shutil.which("ffmpeg")
+            if sys_ytdlp and not (app_dir / ytdlp_local_name).exists():
+                self.ytdlp_path = sys_ytdlp
+                self.log.emit(f"[INFO] Using system yt-dlp: {sys_ytdlp}")
+            if sys_ffmpeg and not (app_dir / ffmpeg_local_name).exists():
+                self.ffmpeg_path = sys_ffmpeg
+                self.log.emit(f"[INFO] Using system ffmpeg: {sys_ffmpeg}")
 
-        # Ensure a local yt-dlp.exe next to the EXE and prefer using it
-        local_ytdlp = app_dir / "yt-dlp.exe"
+        # Ensure a local yt-dlp next to the app and prefer using it
+        local_ytdlp = app_dir / ytdlp_local_name
         if force and local_ytdlp.exists():
             try:
                 local_ytdlp.unlink()
             except Exception:
                 pass
-        if not local_ytdlp.exists():
+        if not local_ytdlp.exists() and not (self.ytdlp_path and Path(self.ytdlp_path).name == "yt-dlp"):
             try:
-                self.log.emit("[INFO] yt-dlp.exe not found next to the app — downloading latest release…")
-                # Use GitHub latest/download stable filename; fallback to API lookup
-                ytdlp_url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+                self.log.emit(f"[INFO] {ytdlp_local_name} not found next to the app — downloading latest release…")
                 _download_url(ytdlp_url, local_ytdlp, user_agent=f"{APP_NAME}/{APP_VERSION}")
                 try:
                     os.chmod(local_ytdlp, 0o755)
                 except Exception:
                     pass
-                self.log.emit("[INFO] Downloaded yt-dlp.exe")
+                self.log.emit(f"[INFO] Downloaded {ytdlp_local_name}")
             except Exception:
                 # Fallback via API
                 alt = github_latest_asset_url(
                     "yt-dlp/yt-dlp",
-                    prefer_substrings=["yt-dlp.exe"],
-                    must_match_regex=r"yt-dlp.*\.exe$",
+                    prefer_substrings=[ytdlp_local_name],
+                    must_match_regex=ytdlp_regex,
                     user_agent=f"{APP_NAME}/{APP_VERSION}"
                 )
                 if alt:
@@ -515,84 +572,122 @@ class StreamWorker(QtCore.QObject):
                             os.chmod(local_ytdlp, 0o755)
                         except Exception:
                             pass
-                        self.log.emit("[INFO] Downloaded yt-dlp.exe via API fallback")
+                        self.log.emit(f"[INFO] Downloaded {ytdlp_local_name} via API fallback")
                     except Exception as e2:
-                        self.log.emit(f"[WARN] Failed to download yt-dlp.exe automatically: {e2}")
+                        self.log.emit(f"[WARN] Failed to download {ytdlp_local_name} automatically: {e2}")
                 else:
-                    self.log.emit("[WARN] Could not determine latest yt-dlp.exe download URL")
+                    self.log.emit(f"[WARN] Could not determine latest {ytdlp_local_name} download URL")
         # Prefer local copy if available
         if local_ytdlp.exists():
             self.ytdlp_path = str(local_ytdlp)
 
-        # Ensure a local ffmpeg.exe next to the EXE and prefer using it
-        local_ffmpeg = app_dir / "ffmpeg.exe"
+        # Ensure a local ffmpeg next to the app and prefer using it
+        local_ffmpeg = app_dir / ffmpeg_local_name
         if force and local_ffmpeg.exists():
             try:
                 local_ffmpeg.unlink()
             except Exception:
                 pass
-        if not local_ffmpeg.exists():
+        if not local_ffmpeg.exists() and not (self.ffmpeg_path and Path(self.ffmpeg_path).name == "ffmpeg"):
             try:
-                self.log.emit("[INFO] ffmpeg.exe not found next to the app — downloading latest Windows build…")
-                # Find a recent Windows x64 zip from BtbN/FFmpeg-Builds via API
-                ff_zip_api_url = github_latest_asset_url(
-                    "BtbN/FFmpeg-Builds",
-                    prefer_substrings=["win64", "lgpl", "shared", "zip"],
-                    must_match_regex=r"ffmpeg-.*win64.*zip$",
-                    user_agent=f"{APP_NAME}/{APP_VERSION}"
-                )
-                if not ff_zip_api_url:
-                    raise RuntimeError("Could not determine latest FFmpeg Windows zip from GitHub API")
-                dest_zip = app_dir / "ffmpeg-latest.zip"
-                _download_url(ff_zip_api_url, dest_zip, user_agent=f"{APP_NAME}/{APP_VERSION}")
+                if sys_name == "windows":
+                    self.log.emit("[INFO] ffmpeg.exe not found next to the app — downloading latest Windows build…")
+                    ff_zip_api_url = github_latest_asset_url(
+                        "BtbN/FFmpeg-Builds",
+                        prefer_substrings=["win64", "lgpl", "shared", "zip"],
+                        must_match_regex=r"ffmpeg-.*win64.*zip$",
+                        user_agent=f"{APP_NAME}/{APP_VERSION}"
+                    )
+                    if not ff_zip_api_url:
+                        raise RuntimeError("Could not determine latest FFmpeg Windows zip from GitHub API")
+                    dest_zip = app_dir / "ffmpeg-latest.zip"
+                    _download_url(ff_zip_api_url, dest_zip, user_agent=f"{APP_NAME}/{APP_VERSION}")
 
-                # Extract ffmpeg.exe
-                ffmpeg_exe_path: Optional[Path] = None
-                try:
-                    with zipfile.ZipFile(dest_zip, 'r') as zf:
-                        # Find ffmpeg.exe inside the archive (path varies by build)
-                        cand = [n for n in zf.namelist() if n.lower().endswith('/bin/ffmpeg.exe') or n.lower().endswith('ffmpeg.exe')]
-                        if not cand:
-                            # Extract all to temp and search
-                            with tempfile.TemporaryDirectory() as tmpd:
-                                zf.extractall(tmpd)
-                                for root, _dirs, files in os.walk(tmpd):
-                                    for f in files:
-                                        if f.lower() == 'ffmpeg.exe':
-                                            ffmpeg_exe_path = Path(root) / f
-                                            break
-                                    if ffmpeg_exe_path:
-                                        break
-                                if not ffmpeg_exe_path:
-                                    raise RuntimeError("ffmpeg.exe not found inside archive")
-                                # Copy to app_dir
+                    ffmpeg_bin_path: Optional[Path] = None
+                    try:
+                        with zipfile.ZipFile(dest_zip, 'r') as zf:
+                            cand = [n for n in zf.namelist() if n.lower().endswith('/bin/ffmpeg.exe') or n.lower().endswith('ffmpeg.exe')]
+                            if cand:
                                 target = local_ffmpeg
-                                shutil.copy2(ffmpeg_exe_path, target)
-                                ffmpeg_exe_path = target
-                        else:
-                            # Directly extract ffmpeg.exe entry
+                                member_name = cand[0]
+                                with zf.open(member_name) as src, open(target, 'wb') as out:
+                                    shutil.copyfileobj(src, out)
+                                ffmpeg_bin_path = target
+                            else:
+                                with tempfile.TemporaryDirectory() as tmpd:
+                                    zf.extractall(tmpd)
+                                    for root, _dirs, files in os.walk(tmpd):
+                                        for f in files:
+                                            if f.lower() == 'ffmpeg.exe':
+                                                ffmpeg_bin_path = Path(root) / f
+                                                break
+                                        if ffmpeg_bin_path:
+                                            break
+                                    if not ffmpeg_bin_path:
+                                        raise RuntimeError("ffmpeg.exe not found inside archive")
+                                    target = local_ffmpeg
+                                    shutil.copy2(ffmpeg_bin_path, target)
+                                    ffmpeg_bin_path = target
+                    finally:
+                        try:
+                            dest_zip.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                elif sys_name == "linux":
+                    if machine not in ("x86_64", "amd64"):
+                        raise RuntimeError(f"Unsupported Linux architecture for auto-download: {machine}")
+                    self.log.emit("[INFO] ffmpeg not found next to the app — downloading latest Linux build…")
+                    ffmpeg_url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+                    dest_tar = app_dir / "ffmpeg-latest.tar.xz"
+                    _download_url(ffmpeg_url, dest_tar, user_agent=f"{APP_NAME}/{APP_VERSION}")
+                    ffmpeg_bin_path = None
+                    try:
+                        with tarfile.open(dest_tar, "r:xz") as tf:
+                            member = next((m for m in tf.getmembers() if m.name.endswith("/ffmpeg")), None)
+                            if not member:
+                                raise RuntimeError("ffmpeg not found inside archive")
+                            with tf.extractfile(member) as src, open(local_ffmpeg, "wb") as out:
+                                if src is None:
+                                    raise RuntimeError("Failed to extract ffmpeg from archive")
+                                shutil.copyfileobj(src, out)
+                            ffmpeg_bin_path = local_ffmpeg
+                    finally:
+                        try:
+                            dest_tar.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                else:
+                    self.log.emit("[INFO] ffmpeg not found next to the app — downloading latest macOS build…")
+                    ffmpeg_url = "https://evermeet.cx/ffmpeg/getrelease/zip"
+                    dest_zip = app_dir / "ffmpeg-latest.zip"
+                    _download_url(ffmpeg_url, dest_zip, user_agent=f"{APP_NAME}/{APP_VERSION}")
+                    ffmpeg_bin_path = None
+                    try:
+                        with zipfile.ZipFile(dest_zip, 'r') as zf:
+                            cand = [n for n in zf.namelist() if n.lower().endswith('/ffmpeg') or n.lower() == 'ffmpeg']
+                            if not cand:
+                                raise RuntimeError("ffmpeg not found inside archive")
                             target = local_ffmpeg
-                            # If entry contains folders, extract then move
                             member_name = cand[0]
                             with zf.open(member_name) as src, open(target, 'wb') as out:
                                 shutil.copyfileobj(src, out)
-                            ffmpeg_exe_path = target
-                finally:
-                    try:
-                        dest_zip.unlink(missing_ok=True)  # cleanup zip
-                    except Exception:
-                        pass
+                            ffmpeg_bin_path = target
+                    finally:
+                        try:
+                            dest_zip.unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
-                if ffmpeg_exe_path and ffmpeg_exe_path.exists():
+                if ffmpeg_bin_path and ffmpeg_bin_path.exists():
                     try:
-                        os.chmod(ffmpeg_exe_path, 0o755)
+                        os.chmod(ffmpeg_bin_path, 0o755)
                     except Exception:
                         pass
-                    self.ffmpeg_path = str(ffmpeg_exe_path)
+                    self.ffmpeg_path = str(ffmpeg_bin_path)
                     self.log.emit("[INFO] FFmpeg downloaded and ready")
             except Exception as e:
                 self.log.emit(
-                    "[ERROR] Could not auto-download FFmpeg. Please place ffmpeg.exe next to the EXE or install FFmpeg in PATH."
+                    f"[ERROR] Could not auto-download FFmpeg. Please place {ffmpeg_local_name} next to the app or install FFmpeg in PATH."
                 )
                 self.log.emit(f"[DETAIL] {e}")
         # Prefer local copy if available
@@ -609,9 +704,11 @@ class StreamWorker(QtCore.QObject):
             gop = max(2, self.cfg.fps * 2)
             vf_chain = [
                 "scale=-2:360:flags=bicubic",
-                f"format={self.cfg.pix_fmt}",
+                "format=yuv420p",
             ]
-            def try_push(url: str) -> Tuple[bool, str]:
+            # Use a safe, software-only encoder for preflight to avoid HW quirks.
+            preflight_encoder = "libx264"
+            def try_push(url: str) -> Tuple[bool, str, int]:
                 cmd = [
                     self.ffmpeg_path or "ffmpeg",
                     "-hide_banner", "-loglevel", "warning", "-stats",
@@ -619,7 +716,7 @@ class StreamWorker(QtCore.QObject):
                     "-f", "lavfi", "-i", "anullsrc=cl=stereo:r=44100",
                     "-t", "1",
                     "-map", "0:v:0", "-map", "1:a:0",
-                    "-c:v", self.cfg.encoder, *(self.cfg.extra_venc_flags or []),
+                    "-c:v", preflight_encoder,
                     "-fflags", "+genpts",
                     "-r", str(self.cfg.fps), "-g", str(gop), "-keyint_min", str(gop),
                     "-b:v", "1000k", "-maxrate", "1000k", "-bufsize", "2000k",
@@ -629,15 +726,20 @@ class StreamWorker(QtCore.QObject):
                 ]
                 try:
                     cp = run_hidden(cmd, capture=True, timeout=15)
-                    return (cp.returncode == 0, (cp.stderr or "").strip())
+                    stderr = (cp.stderr or "").strip()
+                    stdout = (cp.stdout or "").strip()
+                    if cp.returncode == 0:
+                        return (True, "", 0)
+                    err = stderr or stdout or f"ffmpeg exited with code {cp.returncode}"
+                    return (False, err, cp.returncode)
                 except subprocess.TimeoutExpired:
-                    return (False, "RTMP preflight timed out")
+                    return (False, "RTMP preflight timed out", -1)
                 except Exception as e:
-                    return (False, f"RTMP preflight exception: {e}")
+                    return (False, f"RTMP preflight exception: {e}", -1)
 
             self.log.emit("[INFO] Preflight: testing RTMP connectivity…")
             url = self.cfg.rtmp_url()
-            ok, err = try_push(url)
+            ok, err, rc = try_push(url)
             if ok:
                 self.log.emit("[INFO] Preflight: RTMP OK")
                 return True
@@ -654,18 +756,23 @@ class StreamWorker(QtCore.QObject):
                     new_netloc = f"{host}:{new_port}" if host else netloc
                     rtmps_url = urlunparse(("rtmps", new_netloc, u.path, u.params, u.query, u.fragment))
                     self.log.emit("[INFO] Preflight: RTMP failed, trying RTMPS fallback…")
-                    ok2, err2 = try_push(rtmps_url)
+                    ok2, err2, rc2 = try_push(rtmps_url)
                     if ok2:
                         self.log.emit("[INFO] Preflight: RTMPS OK")
                         # Update cfg to use rtmps for the session
                         self.cfg.rtmp_base = rtmps_url.rsplit("/", 1)[0]
                         self.cfg.stream_key = rtmps_url.rsplit("/", 1)[-1]
                         return True
-                    else:
-                        self.log.emit(f"[ERROR] RTMPS preflight failed: {err2}")
+                    if rc2 < 0 and not IS_WIN:
+                        self.log.emit(f"[WARN] RTMPS preflight crashed ({rc2}); skipping preflight.")
+                        return True
+                    self.log.emit(f"[ERROR] RTMPS preflight failed: {err2}")
             except Exception as e2:
                 self.log.emit(f"[WARN] RTMPS fallback error: {e2}")
 
+            if rc < 0 and not IS_WIN:
+                self.log.emit(f"[WARN] RTMP preflight crashed ({rc}); skipping preflight.")
+                return True
             self.log.emit(f"[ERROR] RTMP preflight failed: {err}")
             return False
         except Exception as e:
@@ -719,7 +826,7 @@ class StreamWorker(QtCore.QObject):
     def get_video_ids(self, url: str) -> List[str]:
         """Return a list of video IDs from a YouTube playlist or single video URL."""
         if not self.ytdlp_path:
-            raise RuntimeError("yt-dlp.exe not found. Put it next to the EXE or in PATH.")
+            raise RuntimeError("yt-dlp not found. Put it next to the app or in PATH.")
         
         input_type = detect_input_type(url)
         
@@ -801,7 +908,7 @@ class StreamWorker(QtCore.QObject):
     def get_twitch_hls_url(self, twitch_url: str) -> str:
         """Extract the HLS manifest URL from a Twitch channel/stream URL using yt-dlp."""
         if not self.ytdlp_path:
-            raise RuntimeError("yt-dlp.exe not found.")
+            raise RuntimeError("yt-dlp not found.")
         
         self.log.emit(f"[INFO] Extracting Twitch HLS URL from: {twitch_url}")
         
@@ -823,7 +930,7 @@ class StreamWorker(QtCore.QObject):
     def get_stream_urls(self, video_id: str) -> Tuple[str, Optional[str]]:
         """Return media URLs for a video. Tries HLS first for stability, then falls back to direct URLs."""
         if not self.ytdlp_path:
-            raise RuntimeError("yt-dlp.exe not found.")
+            raise RuntimeError("yt-dlp not found.")
         url = f"https://www.youtube.com/watch?v={video_id}"
         cookies = self._ytdlp_cookies_args()
         
@@ -915,6 +1022,16 @@ class StreamWorker(QtCore.QObject):
         self.cfg.extra_venc_flags = ["-preset", "veryfast"]
         if not self.ffmpeg_path:
             return
+
+        sys_name = platform.system().lower()
+        if sys_name == "darwin":
+            if ffprobe_encoder(self.ffmpeg_path, "h264_videotoolbox"):
+                self.cfg.encoder = "h264_videotoolbox"
+                self.cfg.encoder_name = "Apple VideoToolbox"
+                self.cfg.pix_fmt = "yuv420p"
+                self.cfg.extra_venc_flags = []
+            return
+
         if ffprobe_encoder(self.ffmpeg_path, "h264_nvenc"):
             self.cfg.encoder = "h264_nvenc"
             self.cfg.encoder_name = "NVIDIA NVENC"
@@ -924,6 +1041,22 @@ class StreamWorker(QtCore.QObject):
                 "-spatial_aq", "1", "-temporal_aq", "1", "-aq-strength", "8",
             ]
             return
+
+        if sys_name == "linux":
+            if ffprobe_encoder(self.ffmpeg_path, "h264_vaapi"):
+                self.cfg.encoder = "h264_vaapi"
+                self.cfg.encoder_name = "VAAPI"
+                self.cfg.pix_fmt = "nv12"
+                self.cfg.extra_venc_flags = []
+                return
+            if ffprobe_encoder(self.ffmpeg_path, "h264_qsv"):
+                self.cfg.encoder = "h264_qsv"
+                self.cfg.encoder_name = "Intel Quick Sync"
+                self.cfg.pix_fmt = "nv12"
+                self.cfg.extra_venc_flags = ["-look_ahead", "1"]
+                return
+            return
+
         if ffprobe_encoder(self.ffmpeg_path, "h264_qsv"):
             self.cfg.encoder = "h264_qsv"
             self.cfg.encoder_name = "Intel Quick Sync"
@@ -957,7 +1090,10 @@ class StreamWorker(QtCore.QObject):
                 font_arg +
                 f"fontcolor=white:fontsize={fontsize}:box=1:boxcolor=black@0.5:x=10:y=10"
             )
-        vf.append(f"format={self.cfg.pix_fmt}")  # keep format as a separate filter
+        if self.cfg.encoder == "h264_vaapi":
+            vf.append("format=nv12,hwupload")
+        else:
+            vf.append(f"format={self.cfg.pix_fmt}")  # keep format as a separate filter
         vf_chain = ",".join(vf)
 
         # Detect if we're using HLS (m3u8) or direct URLs
@@ -976,6 +1112,9 @@ class StreamWorker(QtCore.QObject):
             "-probesize", buffer_settings["probesize"],
             "-analyzeduration", buffer_settings["analyzeduration"],
         ]
+
+        if self.cfg.encoder == "h264_vaapi":
+            cmd += ["-vaapi_device", "/dev/dri/renderD128"]
         
         # HLS-specific input options for better stability
         if is_hls:
@@ -1110,7 +1249,9 @@ class StreamWorker(QtCore.QObject):
             t.join(timeout=0.2)
 
         # Ensure any buffered ffmpeg output is flushed after the process exits
+        rc = None
         if self.ff_proc:
+            rc = self.ff_proc.poll()
             for stream in (self.ff_proc.stdout, self.ff_proc.stderr):
                 if stream:
                     leftover = stream.read()
@@ -1119,6 +1260,12 @@ class StreamWorker(QtCore.QObject):
                             self.log.emit(line.rstrip())
                     stream.close()
             self.ff_proc = None
+        if rc is not None and not self._stop.is_set():
+            self.log.emit(f"[INFO] ffmpeg exited with code {rc}")
+            if rc < 0 and self._maybe_switch_to_system_ffmpeg("ffmpeg crashed during Twitch stream"):
+                raise RuntimeError("ffmpeg crashed; switched to system ffmpeg, retrying")
+            if rc != 0:
+                raise RuntimeError(f"ffmpeg exited with code {rc}")
 
     def run_one_video(self, video_id: str):
         """Stream a single video using ffmpeg."""
@@ -1213,7 +1360,9 @@ class StreamWorker(QtCore.QObject):
             t.join(timeout=0.2)
 
         # Ensure any buffered ffmpeg output is flushed after the process exits
+        rc = None
         if self.ff_proc:
+            rc = self.ff_proc.poll()
             for stream in (self.ff_proc.stdout, self.ff_proc.stderr):
                 if stream:
                     leftover = stream.read()
@@ -1222,6 +1371,12 @@ class StreamWorker(QtCore.QObject):
                             self.log.emit(line.rstrip())
                     stream.close()
             self.ff_proc = None
+        if rc is not None and not (self._stop.is_set() or self._skip.is_set()):
+            self.log.emit(f"[INFO] ffmpeg exited with code {rc}")
+            if rc < 0 and self._maybe_switch_to_system_ffmpeg("ffmpeg crashed during YouTube stream"):
+                raise RuntimeError("ffmpeg crashed; switched to system ffmpeg, retrying")
+            if rc != 0:
+                raise RuntimeError(f"ffmpeg exited with code {rc}")
         
         # CRITICAL: Wait for RTMP connection to fully close before starting next video
         # Without this delay, the RTMP server rejects the new connection (only 1 connection per key allowed)
@@ -1240,11 +1395,11 @@ class StreamWorker(QtCore.QObject):
             pass
 
         if not self.ffmpeg_path:
-            self.log.emit("[ERROR] ffmpeg not found. Put ffmpeg.exe next to the EXE or in PATH.")
+            self.log.emit("[ERROR] ffmpeg not found. Put ffmpeg next to the app or in PATH.")
             self.finished.emit()
             return
         if not self.ytdlp_path:
-            self.log.emit("[ERROR] yt-dlp.exe not found. Put yt-dlp.exe next to the EXE or in PATH.")
+            self.log.emit("[ERROR] yt-dlp not found. Put yt-dlp next to the app or in PATH.")
             self.finished.emit()
             return
 
@@ -1440,9 +1595,11 @@ class MainWindow(QtWidgets.QWidget):
         self.check_updates_startup_chk = QtWidgets.QCheckBox("Check for updates on startup")
         self.check_updates_startup_chk.setChecked(True)
 
-        self.console = QtWidgets.QTextEdit()
+        self.console = QtWidgets.QPlainTextEdit()
         self.console.setReadOnly(True)
         self.console.setVisible(True)
+        self.console.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self.console.setMaximumBlockCount(5000)
 
         self.start_btn = QtWidgets.QPushButton("Start Stream")
         self.stop_btn = QtWidgets.QPushButton("Stop Stream")
@@ -1540,7 +1697,7 @@ class MainWindow(QtWidgets.QWidget):
         self.check_update_btn.clicked.connect(self.check_for_updates)
         update_controls_layout.addWidget(self.check_update_btn)
         self.force_update_btn = QtWidgets.QPushButton("Force Update Binaries (yt-dlp & FFmpeg)")
-        self.force_update_btn.setToolTip("Re-download latest yt-dlp.exe and ffmpeg.exe next to the app")
+        self.force_update_btn.setToolTip("Re-download latest yt-dlp and FFmpeg next to the app")
         self.force_update_btn.clicked.connect(self.on_force_update_binaries)
         update_controls_layout.addWidget(self.force_update_btn)
         update_controls_layout.addStretch(1)
@@ -1722,7 +1879,7 @@ class MainWindow(QtWidgets.QWidget):
     # --- UI helpers ---
     def append_log(self, text: str):
         """Append text to the on-screen console and optional log file."""
-        self.console.append(text)
+        self.console.appendPlainText(text)
         self.console.moveCursor(QtGui.QTextCursor.MoveOperation.End)
         if self.log_fh:
             try:
