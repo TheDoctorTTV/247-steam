@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Stream247
+Comment=24/7 VOD streamer and Twitch relay
+Exec=Stream247
+Icon=Stream247
+Terminal=false
+Categories=AudioVideo;Video;Network;

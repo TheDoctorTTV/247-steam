@@ -130,6 +130,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-appimage
 env/
 venv/
 ENV/
@@ -185,3 +186,18 @@ ffmpeg.exe
 yt-dlp.exe
 Flow_Background.mp4
 build_and_sign.bat
+
+appimage/dist
+appimage/build
+appimage/AppDir
+Stream247.AppImage
+appimage/Stream247.spec
+appimage/Stream247.png
+squashfs-root/
+.vscode/
+yt-dlp
+yt-dlp.exe
+ffmpeg.exe
+ffmpeg
+__pycache__
+*.pyc    

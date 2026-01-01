@@ -66,6 +66,22 @@ Restream, custom Nginx-RTMP**, and more. Stream247 automatically selects the bes
   for RTMP or 443 for RTMPS) is allowed.
 - Designed for **24/7 operation** — great for music channels, replay loops, relays, or archives.
 
+## Linux AppImage build
+
+AppImage builds are supported via the helper script in `appimage/`.
+
+Requirements:
+- `python3` with venv support
+- `appimagetool` in your PATH (from AppImageKit releases)
+- Runtime dependencies on the host: `ffmpeg` and `yt-dlp` available in PATH
+
+Build:
+```bash
+./appimage/build_appimage.sh
+```
+
+The output will be `Stream247.AppImage` in the repo root.
+
 ### Current scope
 
 Stream247 now operates as both a **24/7 VOD streamer** (YouTube playlists or single videos)

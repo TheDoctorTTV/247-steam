@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+APPDIR="$(dirname "$(readlink -f "$0")")"
+export APPDIR
+export PATH="$APPDIR/usr/bin:$PATH"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+
+exec "$APPDIR/usr/bin/Stream247" "$@"
